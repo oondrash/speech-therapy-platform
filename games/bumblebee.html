@@ -361,7 +361,11 @@ function App() {
     const time = new Float32Array(analyser.fftSize);
     const detect = makeZhDetector(analyser.context.sampleRate, analyser.fftSize);
     let confirm = 0;
+    const actx = analyser.context;
     timerRef.current = setInterval(() => {
+      // iOS Safari parks the context ('suspended'/'interrupted') after a system
+      // sound or a screen dim, which freezes the analyser. Nudge it back.
+      if (actx.state !== 'running' && actx.resume) actx.resume();
       analyser.getFloatFrequencyData(freq);
       analyser.getFloatTimeDomainData(time);
       let sum = 0; for (let i = 0; i < time.length; i++) sum += time[i]*time[i];
@@ -450,7 +454,14 @@ function App() {
 
   const startGame = useCallback(async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      // Disable the browser's voice DSP: autoGainControl quietly turns the mic
+      // down on a sustained buzz (so the bee climbs, then stops responding) and
+      // noiseSuppression strips the high-frequency frication "Ж" lives in. These
+      // are aggressive on phones, mild on desktop — hence the desktop-only bug.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+        video: false,
+      });
       const actx = new (window.AudioContext || window.webkitAudioContext)();
       if (actx.state === 'suspended') await actx.resume();
       const src = actx.createMediaStreamSource(stream);
