@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Кабінет логопеда — живий перегляд</title>
   <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <script src="lib/ice-config.js"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
@@ -129,6 +130,12 @@
 <script>
 (function () {
   var PREFIX = 'splog-';
+  // ICE (STUN/TURN) config shared via lib/ice-config.js (window.ICE_SERVERS).
+  var ICE = {
+    iceServers: (window.ICE_SERVERS && window.ICE_SERVERS.length)
+      ? window.ICE_SERVERS
+      : [{ urls: 'stun:stun.l.google.com:19302' }]
+  };
   var els = {
     code: document.getElementById('code'),
     link: document.getElementById('link'),
@@ -178,7 +185,7 @@
     els.placeholder.style.display = '';
     els.video.srcObject = null;
 
-    peer = new Peer(PREFIX + code, { debug: 1 });
+    peer = new Peer(PREFIX + code, { debug: 1, config: ICE });
 
     peer.on('open', function () {
       setStatus('Готово — очікую дитину', '#e6a020');
