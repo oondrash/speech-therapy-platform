@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Котик-танцюрист — ритм «Да-да-да»</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body, #root { width: 100%; height: 100%; overflow: hidden; }
+    body {
+      font-family: 'Comic Sans MS', 'Chalkboard SE', 'Arial Rounded MT Bold', cursive;
+      touch-action: none; user-select: none; -webkit-user-select: none;
+    }
+    canvas { display: block; }
+    #root { position: relative; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ─── Onset detection tuning ──────────────────────────────────────────────────
+const ONSET_MIN_RMS  = 0.045;  // absolute loudness floor for a "да"
+const HIGH_FACTOR    = 3.0;    // fire when rms > noiseFloor × this
+const LOW_FACTOR     = 1.8;    // re-arm when rms drops below noiseFloor × this
+const REFRACTORY_MS  = 130;    // min gap between two counted beats
+const FLOOR_MIN      = 0.003;
+const FLOOR_MAX      = 0.08;
+
+const PRAISE = ['Так! 🎵', 'Браво! 👏', 'Танцюй! 💃', 'Супер! ⭐', 'Ще! 🥁', 'Молодець! 🌟'];
+
+// ─── Utility ─────────────────────────────────────────────────────────────────
+function lerp(a, b, t) { return a + (b - a) * t; }
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+// ─── Onset detector (Schmitt trigger) ────────────────────────────────────────
+// A beat fires on the rising edge above a HIGH threshold; the trigger must fall
+// back below a LOW threshold before it can fire again (hysteresis). The noise
+// floor adapts only while quiet, so loud "да" bursts never inflate it.
+function makeOnsetDetector() {
+  let noiseFloor = 0.006;
+  let lastOnset = -9999;
+  let armed = true;
+
+  return function detect(rms, nowMs) {
+    const high = Math.max(ONSET_MIN_RMS, noiseFloor * HIGH_FACTOR);
+    const low  = Math.max(noiseFloor * LOW_FACTOR, high * 0.5);
+
+    let onset = false;
+    if (rms > high && armed && (nowMs - lastOnset) > REFRACTORY_MS) {
+      onset = true;
+      lastOnset = nowMs;
+      armed = false;
+    }
+    if (rms < low) {
+      armed = true;
+      // track the quiet background only (slow follower)
+      noiseFloor = clamp(lerp(noiseFloor, rms, 0.05), FLOOR_MIN, FLOOR_MAX);
+    }
+    return { onset, baseline: noiseFloor };
+  };
+}
+
+// ─── Background ──────────────────────────────────────────────────────────────
+const CONFETTI_COLORS = ['#FF6B6B', '#FFD93D', '#6BCB77', '#4D96FF', '#C780FA', '#FF9F45'];
+
+// ─── Cat drawing (articulated, can dance) ────────────────────────────────────
+// cx,cy = floor anchor point (feet). bounce 0..1 lift. tilt = head lean.
+// pawPhase: -1..1 which paw is up. earWiggle, blink.
+function drawCat(ctx, cx, cy, W, anim) {
+  const { bounce, tilt, pawPhase, beatPulse, blink, t } = anim;
+  const s = W * 0.16;                       // overall scale
+  const lift = bounce * s * 0.35;           // vertical hop
+  const squash = 1 - bounce * 0.12;         // squash & stretch
+  const stretch = 1 + bounce * 0.12;
+
+  ctx.save();
+  ctx.translate(cx, cy - lift);
+
+  // shadow (shrinks as it hops)
+  ctx.save();
+  ctx.globalAlpha = 0.18 - bounce * 0.08;
+  ctx.fillStyle = '#000';
+  ctx.beginPath();
+  ctx.ellipse(0, lift + s * 0.05, s * 0.6 * (1 - bounce * 0.2), s * 0.12, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  ctx.scale(squash, stretch);
+
+  const orange = '#FFA94D', orangeDark = '#F08C3A', cream = '#FFE8D6';
+
+  // ── Tail (sways with time + beat) ──
+  ctx.save();
+  ctx.strokeStyle = orange;
+  ctx.lineWidth = s * 0.16;
+  ctx.lineCap = 'round';
+  const tailSway = Math.sin(t / 280) * 0.5 + pawPhase * 0.4;
+  ctx.beginPath();
+  ctx.moveTo(-s * 0.45, -s * 0.15);
+  ctx.quadraticCurveTo(
+    -s * 0.95, -s * 0.25 + tailSway * s * 0.3,
+    -s * 0.8 + tailSway * s * 0.4, -s * 0.75 + Math.abs(tailSway) * s * 0.1);
+  ctx.stroke();
+  ctx.restore();
+
+  // ── Legs / feet ──
+  ctx.fillStyle = orangeDark;
+  [[-s * 0.25, 1], [s * 0.25, -1]].forEach(([fx, side]) => {
+    const foot = pawPhase * side * s * 0.08;
+    ctx.beginPath();
+    ctx.ellipse(fx, -s * 0.02 + foot, s * 0.16, s * 0.1, 0, 0, Math.PI * 2);
+    ctx.fill();
+  });
+
+  // ── Body ──
+  const bodyGrad = ctx.createLinearGradient(0, -s * 0.9, 0, 0);
+  bodyGrad.addColorStop(0, orange);
+  bodyGrad.addColorStop(1, orangeDark);
+  ctx.fillStyle = bodyGrad;
+  ctx.beginPath();
+  ctx.ellipse(0, -s * 0.42, s * 0.42, s * 0.5, 0, 0, Math.PI * 2);
+  ctx.fill();
+  // belly
+  ctx.fillStyle = cream;
+  ctx.beginPath();
+  ctx.ellipse(0, -s * 0.34, s * 0.24, s * 0.34, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // ── Arms (dance! alternate up with the beat) ──
+  ctx.strokeStyle = orange;
+  ctx.lineWidth = s * 0.15;
+  ctx.lineCap = 'round';
+  const armUpL = clamp(-pawPhase, 0, 1) * (0.6 + beatPulse * 0.6);
+  const armUpR = clamp(pawPhase, 0, 1) * (0.6 + beatPulse * 0.6);
+  // left arm
+  ctx.beginPath();
+  ctx.moveTo(-s * 0.3, -s * 0.5);
+  ctx.lineTo(-s * 0.55, -s * 0.5 - armUpL * s * 0.6);
+  ctx.stroke();
+  ctx.fillStyle = cream;
+  ctx.beginPath();
+  ctx.arc(-s * 0.55, -s * 0.5 - armUpL * s * 0.6, s * 0.1, 0, Math.PI * 2);
+  ctx.fill();
+  // right arm
+  ctx.strokeStyle = orange;
+  ctx.beginPath();
+  ctx.moveTo(s * 0.3, -s * 0.5);
+  ctx.lineTo(s * 0.55, -s * 0.5 - armUpR * s * 0.6);
+  ctx.stroke();
+  ctx.fillStyle = cream;
+  ctx.beginPath();
+  ctx.arc(s * 0.55, -s * 0.5 - armUpR * s * 0.6, s * 0.1, 0, Math.PI * 2);
+  ctx.fill();
+
+  // ── Head (tilts with the dance) ──
+  ctx.save();
+  ctx.translate(0, -s * 0.92);
+  ctx.rotate(tilt * 0.25);
+
+  // ears
+  ctx.fillStyle = orange;
+  [[-1], [1]].forEach(([side]) => {
+    ctx.beginPath();
+    ctx.moveTo(side * s * 0.22, -s * 0.28);
+    ctx.lineTo(side * s * 0.42, -s * 0.52);
+    ctx.lineTo(side * s * 0.05, -s * 0.36);
+    ctx.closePath();
+    ctx.fill();
+    // inner ear
+    ctx.fillStyle = '#FFB6C1';
+    ctx.beginPath();
+    ctx.moveTo(side * s * 0.24, -s * 0.32);
+    ctx.lineTo(side * s * 0.34, -s * 0.46);
+    ctx.lineTo(side * s * 0.14, -s * 0.36);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = orange;
+  });
+
+  // head shape
+  const headGrad = ctx.createLinearGradient(0, -s * 0.35, 0, s * 0.35);
+  headGrad.addColorStop(0, orange);
+  headGrad.addColorStop(1, orangeDark);
+  ctx.fillStyle = headGrad;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, s * 0.42, s * 0.38, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // cheeks (cream)
+  ctx.fillStyle = cream;
+  ctx.beginPath();
+  ctx.ellipse(0, s * 0.08, s * 0.3, s * 0.22, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // eyes
+  const eyeY = -s * 0.04;
+  if (blink > 0.5) {
+    ctx.strokeStyle = '#3a2b22';
+    ctx.lineWidth = s * 0.04;
+    [[-1], [1]].forEach(([side]) => {
+      ctx.beginPath();
+      ctx.arc(side * s * 0.16, eyeY, s * 0.08, 0.2, Math.PI - 0.2);
+      ctx.stroke();
+    });
+  } else {
+    [[-1], [1]].forEach(([side]) => {
+      ctx.fillStyle = '#3a2b22';
+      ctx.beginPath();
+      ctx.ellipse(side * s * 0.16, eyeY, s * 0.07, s * 0.09, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#fff';
+      ctx.beginPath();
+      ctx.arc(side * s * 0.16 + s * 0.02, eyeY - s * 0.03, s * 0.025, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
+
+  // nose
+  ctx.fillStyle = '#FF7A8A';
+  ctx.beginPath();
+  ctx.moveTo(0, s * 0.06);
+  ctx.lineTo(-s * 0.05, s * 0.01);
+  ctx.lineTo(s * 0.05, s * 0.01);
+  ctx.closePath();
+  ctx.fill();
+
+  // mouth (smiles wider on a beat)
+  ctx.strokeStyle = '#3a2b22';
+  ctx.lineWidth = s * 0.025;
+  ctx.beginPath();
+  ctx.moveTo(0, s * 0.06);
+  ctx.lineTo(0, s * 0.12);
+  const smile = s * (0.1 + beatPulse * 0.05);
+  ctx.moveTo(-smile, s * 0.12);
+  ctx.quadraticCurveTo(-s * 0.04, s * 0.2, 0, s * 0.16);
+  ctx.quadraticCurveTo(s * 0.04, s * 0.2, smile, s * 0.12);
+  ctx.stroke();
+
+  // whiskers
+  ctx.lineWidth = s * 0.015;
+  [[-1], [1]].forEach(([side]) => {
+    for (let i = 0; i < 3; i++) {
+      ctx.beginPath();
+      ctx.moveTo(side * s * 0.18, s * 0.04 + i * s * 0.04);
+      ctx.lineTo(side * s * 0.5, s * (0.0 + i * 0.05) - s * 0.04);
+      ctx.stroke();
+    }
+  });
+
+  ctx.restore(); // head
+  ctx.restore(); // cat
+}
+
+// ─── Drum drawing ────────────────────────────────────────────────────────────
+function drawDrum(ctx, cx, cy, W, beatPulse) {
+  const s = W * 0.1;
+  ctx.save();
+  ctx.translate(cx, cy);
+  const squash = 1 + beatPulse * 0.12;
+  // body
+  const g = ctx.createLinearGradient(-s, 0, s, 0);
+  g.addColorStop(0, '#c0392b'); g.addColorStop(0.5, '#e74c3c'); g.addColorStop(1, '#c0392b');
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.ellipse(0, s * 0.4, s, s * 0.45, 0, 0, Math.PI * 2);
+  ctx.fillRect(-s, -s * 0.1, s * 2, s * 0.5);
+  ctx.fill();
+  // top skin
+  ctx.fillStyle = '#FBE8C8';
+  ctx.beginPath();
+  ctx.ellipse(0, -s * 0.1, s * squash, s * 0.45 * squash, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = '#f1c40f';
+  ctx.lineWidth = s * 0.12;
+  ctx.beginPath();
+  ctx.ellipse(0, -s * 0.1, s * squash, s * 0.45 * squash, 0, 0, Math.PI * 2);
+  ctx.stroke();
+  // zig-zag lacing
+  ctx.strokeStyle = '#f1c40f';
+  ctx.lineWidth = s * 0.05;
+  for (let i = 0; i < 8; i++) {
+    const a = (Math.PI * 2 / 8) * i;
+    ctx.beginPath();
+    ctx.moveTo(Math.cos(a) * s * 0.9, -s * 0.1 + Math.sin(a) * s * 0.4);
+    ctx.lineTo(Math.cos(a + 0.3) * s * 0.95, s * 0.4);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+// ─── Scene renderer ──────────────────────────────────────────────────────────
+function drawScene(ctx, W, H, state) {
+  const { anim, beats, rms, baseline, onsetFlash, showTherapist,
+          confetti, praise, praiseAlpha, notes, tempo } = state;
+
+  // background — warm stage gradient
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, '#7C5CBF');
+  bg.addColorStop(0.5, '#9B6DD6');
+  bg.addColorStop(1, '#C98BDB');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+
+  // stage floor
+  const floorY = H * 0.82;
+  const floor = ctx.createLinearGradient(0, floorY, 0, H);
+  floor.addColorStop(0, '#E8A0C0');
+  floor.addColorStop(1, '#D17BA8');
+  ctx.fillStyle = floor;
+  ctx.fillRect(0, floorY, W, H - floorY);
+
+  // spotlight glow behind cat (pulses with beat)
+  ctx.save();
+  const glowR = W * (0.32 + onsetFlash * 0.1);
+  const glow = ctx.createRadialGradient(W * 0.5, floorY - H * 0.12, 0, W * 0.5, floorY - H * 0.12, glowR);
+  glow.addColorStop(0, `rgba(255,245,200,${0.35 + onsetFlash * 0.25})`);
+  glow.addColorStop(1, 'rgba(255,245,200,0)');
+  ctx.fillStyle = glow;
+  ctx.fillRect(0, 0, W, H);
+  ctx.restore();
+
+  // floating music notes
+  notes.forEach(n => {
+    ctx.save();
+    ctx.globalAlpha = n.alpha;
+    ctx.font = `${n.size}px serif`;
+    ctx.fillStyle = n.color;
+    ctx.translate(n.x, n.y);
+    ctx.rotate(n.rot);
+    ctx.fillText(n.glyph, 0, 0);
+    ctx.restore();
+  });
+
+  // confetti
+  confetti.forEach(c => {
+    ctx.save();
+    ctx.globalAlpha = c.alpha;
+    ctx.translate(c.x, c.y);
+    ctx.rotate(c.rot);
+    ctx.fillStyle = c.color;
+    ctx.fillRect(-c.size / 2, -c.size / 2, c.size, c.size * 0.6);
+    ctx.restore();
+  });
+
+  // drum (left of cat) + cat
+  drawDrum(ctx, W * 0.5, floorY - H * 0.01, W, anim.beatPulse);
+  drawCat(ctx, W * 0.5, floorY - H * 0.06, W, anim);
+
+  // ── Beat counter (top) ──
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.font = `bold ${Math.round(W * 0.09)}px "Comic Sans MS", cursive`;
+  ctx.fillStyle = '#fff';
+  ctx.strokeStyle = 'rgba(90,50,140,0.6)';
+  ctx.lineWidth = 6;
+  ctx.strokeText(`🥁 ${beats}`, W * 0.5, H * 0.13);
+  ctx.fillText(`🥁 ${beats}`, W * 0.5, H * 0.13);
+  ctx.restore();
+
+  // ── Tempo bar (how fast the child is drumming) ──
+  const tbW = W * 0.5, tbH = 14, tbX = W * 0.25, tbY = H * 0.17;
+  ctx.fillStyle = 'rgba(255,255,255,0.25)';
+  roundRect(ctx, tbX, tbY, tbW, tbH, 7); ctx.fill();
+  ctx.fillStyle = '#FFD93D';
+  roundRect(ctx, tbX, tbY, tbW * clamp(tempo, 0, 1), tbH, 7); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  ctx.font = `${Math.round(W * 0.03)}px "Comic Sans MS", cursive`;
+  ctx.textAlign = 'center';
+  ctx.fillText('темп', W * 0.5, tbY - 6);
+
+  // ── Praise text ──
+  if (praise && praiseAlpha > 0) {
+    ctx.save();
+    ctx.globalAlpha = praiseAlpha;
+    ctx.textAlign = 'center';
+    ctx.font = `bold ${Math.round(W * 0.075)}px "Comic Sans MS", cursive`;
+    ctx.fillStyle = '#FFE66D';
+    ctx.strokeStyle = 'rgba(120,60,160,0.7)';
+    ctx.lineWidth = 5;
+    ctx.strokeText(praise, W * 0.5, H * 0.4);
+    ctx.fillText(praise, W * 0.5, H * 0.4);
+    ctx.restore();
+  }
+
+  // ── Mic level bar (bottom) ──
+  const grassY = H;
+  const mbW = W * 0.4, mbH = 18, mbX = 18, mbY = grassY - mbH - 18;
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  roundRect(ctx, mbX, mbY, mbW, mbH, 9); ctx.fill();
+  const lvl = clamp(rms / 0.25, 0, 1);
+  ctx.fillStyle = onsetFlash > 0.3 ? '#6BCB77' : '#4D96FF';
+  roundRect(ctx, mbX, mbY, mbW * lvl, mbH, 9); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,0.7)';
+  ctx.font = `${Math.round(mbH * 0.9)}px sans-serif`;
+  ctx.textAlign = 'left';
+  ctx.fillText('🎤', mbX + mbW + 6, mbY + mbH - 1);
+
+  // ── Therapist overlay ──
+  if (showTherapist) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    roundRect(ctx, 10, 10, 210, 78, 12); ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = '13px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`RMS:  ${rms.toFixed(4)}`, 20, 32);
+    ctx.fillText(`Base: ${baseline.toFixed(4)}`, 20, 52);
+    ctx.fillText(`Beats: ${beats}`, 20, 72);
+    ctx.restore();
+  }
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+// ─── Main App ─────────────────────────────────────────────────────────────────
+function App() {
+  const canvasRef = useRef(null);
+  const audioRef = useRef(null);
+  const rafRef = useRef(null);
+  const timerRef = useRef(null);
+
+  const stateRef = useRef({
+    anim: { bounce: 0, tilt: 0, pawPhase: 0, beatPulse: 0, blink: 0, t: 0 },
+    pawSide: 1,
+    beats: 0,
+    rms: 0,
+    baseline: 0,
+    onsetFlash: 0,
+    onsetPending: 0,    // set by audio thread, consumed by anim loop
+    confetti: [],
+    notes: [],
+    praise: null,
+    praiseAlpha: 0,
+    beatTimes: [],      // timestamps of recent beats (for tempo)
+    tempo: 0,
+    lastTime: 0,
+    nextBlink: 1500,
+    showTherapist: false,
+  });
+
+  const [phase, setPhase] = useState('start');
+  const [showTherapist, setShowTherapist] = useState(false);
+
+  useEffect(() => { stateRef.current.showTherapist = showTherapist; }, [showTherapist]);
+
+  // Audio analysis (every 20ms) — pure onset detection
+  const startAudio = useCallback((analyser) => {
+    const buf = new Float32Array(analyser.fftSize);
+    const detector = makeOnsetDetector();
+    timerRef.current = setInterval(() => {
+      analyser.getFloatTimeDomainData(buf);
+      let sum = 0;
+      for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+      const rms = Math.sqrt(sum / buf.length);
+      const { onset, baseline } = detector(rms, performance.now());
+      const s = stateRef.current;
+      s.rms = rms;
+      s.baseline = baseline;
+      if (onset) s.onsetPending += 1;
+    }, 20);
+  }, []);
+
+  const spawnBeatFx = useCallback((s, W, H) => {
+    const cx = W * 0.5, cy = H * 0.82 - H * 0.4;
+    // music notes
+    const glyphs = ['♪', '♫', '♬', '♩'];
+    for (let i = 0; i < 3; i++) {
+      s.notes.push({
+        x: cx + (Math.random() - 0.5) * W * 0.3,
+        y: cy + (Math.random() - 0.5) * H * 0.1,
+        glyph: glyphs[Math.floor(Math.random() * glyphs.length)],
+        size: W * (0.04 + Math.random() * 0.03),
+        color: CONFETTI_COLORS[Math.floor(Math.random() * CONFETTI_COLORS.length)],
+        alpha: 1, rot: (Math.random() - 0.5) * 0.6,
+        vx: (Math.random() - 0.5) * 1.5, vy: -1.5 - Math.random() * 1.5,
+        vr: (Math.random() - 0.5) * 0.05,
+      });
+    }
+    // confetti
+    for (let i = 0; i < 10; i++) {
+      s.confetti.push({
+        x: cx + (Math.random() - 0.5) * W * 0.2,
+        y: cy,
+        size: W * 0.012,
+        color: CONFETTI_COLORS[Math.floor(Math.random() * CONFETTI_COLORS.length)],
+        alpha: 1, rot: Math.random() * Math.PI,
+        vx: (Math.random() - 0.5) * 6, vy: -4 - Math.random() * 4,
+        vr: (Math.random() - 0.5) * 0.3,
+      });
+    }
+  }, []);
+
+  const animate = useCallback((now) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    const s = stateRef.current;
+    const dt = s.lastTime ? Math.min(now - s.lastTime, 50) : 16;
+    s.lastTime = now;
+    s.anim.t = now;
+
+    // consume pending onsets from the audio thread
+    while (s.onsetPending > 0) {
+      s.onsetPending -= 1;
+      s.beats += 1;
+      s.pawSide *= -1;
+      s.anim.bounce = 1;          // trigger hop
+      s.anim.beatPulse = 1;
+      s.anim.pawPhase = s.pawSide; // target paw
+      s.onsetFlash = 1;
+      s.beatTimes.push(now);
+      spawnBeatFx(s, W, H);
+      // praise every 8 beats
+      if (s.beats % 8 === 0) {
+        s.praise = PRAISE[Math.floor(Math.random() * PRAISE.length)];
+        s.praiseAlpha = 1;
+      }
+    }
+
+    // tempo: beats in the last 2s, mapped to 0..1 (≈3 beats/s = full)
+    const cutoff = now - 2000;
+    s.beatTimes = s.beatTimes.filter(t => t > cutoff);
+    s.tempo = clamp(s.beatTimes.length / 6, 0, 1);
+
+    // decay animation drivers toward rest (springy)
+    s.anim.bounce = lerp(s.anim.bounce, 0, 0.12 * (dt / 16));
+    s.anim.beatPulse = lerp(s.anim.beatPulse, 0, 0.1 * (dt / 16));
+    s.anim.pawPhase = lerp(s.anim.pawPhase, 0, 0.06 * (dt / 16));
+    s.onsetFlash = lerp(s.onsetFlash, 0, 0.08 * (dt / 16));
+    // gentle idle sway when not beating
+    s.anim.tilt = Math.sin(now / 500) * 0.15 + s.anim.pawPhase * 0.4;
+
+    // blinking
+    s.nextBlink -= dt;
+    if (s.nextBlink <= 0) {
+      s.anim.blink = 1;
+      if (s.nextBlink < -160) { s.anim.blink = 0; s.nextBlink = 1500 + Math.random() * 2500; }
+    }
+
+    // update particles
+    s.notes = s.notes.map(n => ({
+      ...n, x: n.x + n.vx, y: n.y + n.vy, rot: n.rot + n.vr, alpha: n.alpha - 0.014,
+    })).filter(n => n.alpha > 0);
+    s.confetti = s.confetti.map(c => ({
+      ...c, x: c.x + c.vx, y: c.y + c.vy, vy: c.vy + 0.25,
+      rot: c.rot + c.vr, alpha: c.alpha - 0.012,
+    })).filter(c => c.alpha > 0);
+
+    if (s.praiseAlpha > 0) s.praiseAlpha = Math.max(0, s.praiseAlpha - 0.012);
+
+    drawScene(ctx, W, H, s);
+
+    // live telemetry for the therapist view
+    window.__telemetry = {
+      game: '🐱 Котик-танцюрист',
+      primaryLabel: 'Удари 🥁',
+      primary: String(s.beats),
+      detect: s.onsetFlash > 0.3,
+      level: s.rms,
+      extra: 'темп ' + Math.round(s.tempo * 100) + '%',
+    };
+
+    rafRef.current = requestAnimationFrame(animate);
+  }, [spawnBeatFx]);
+
+  const startGame = useCallback(async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      const actx = new (window.AudioContext || window.webkitAudioContext)();
+      if (actx.state === 'suspended') await actx.resume(); // some browsers start suspended
+      const src = actx.createMediaStreamSource(stream);
+      const analyser = actx.createAnalyser();
+      analyser.fftSize = 1024;
+      analyser.smoothingTimeConstant = 0;  // we want raw, fast envelope for onsets
+      src.connect(analyser);
+      audioRef.current = { actx, stream };
+      startAudio(analyser);
+      setPhase('playing');
+      rafRef.current = requestAnimationFrame(animate);
+    } catch (e) {
+      console.error(e);
+      setPhase('denied');
+    }
+  }, [animate, startAudio]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const resize = () => { canvas.width = window.innerWidth; canvas.height = window.innerHeight; };
+    resize();
+    window.addEventListener('resize', resize);
+    return () => window.removeEventListener('resize', resize);
+  }, []);
+
+  useEffect(() => () => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    if (timerRef.current) clearInterval(timerRef.current);
+    if (audioRef.current) {
+      audioRef.current.stream.getTracks().forEach(t => t.stop());
+      audioRef.current.actx.close();
+    }
+  }, []);
+
+  return (
+    <div style={{ width: '100%', height: '100%', position: 'relative' }}>
+      <canvas ref={canvasRef} style={{ position: 'absolute', inset: 0 }} />
+      {phase === 'start' && <StartScreen onStart={startGame} />}
+      {phase === 'denied' && <PermissionDenied onRetry={startGame} />}
+      {phase === 'playing' && (
+        <TherapistToggle active={showTherapist} onToggle={() => setShowTherapist(v => !v)} />
+      )}
+    </div>
+  );
+}
+
+// ─── Start Screen ─────────────────────────────────────────────────────────────
+function StartScreen({ onStart }) {
+  return (
+    <div style={{
+      position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column',
+      alignItems: 'center', justifyContent: 'center',
+      background: 'linear-gradient(160deg, #9B6DD6 0%, #C98BDB 100%)',
+    }}>
+      <div style={{
+        fontSize: 'clamp(24px, 6.5vw, 60px)', fontWeight: 'bold', color: '#fff',
+        textShadow: '2px 3px 0 rgba(90,50,140,0.5)', textAlign: 'center',
+        padding: '0 20px', marginBottom: '6px',
+      }}>🐱 Котик-танцюрист 🥁</div>
+      <div style={{
+        fontSize: 'clamp(14px, 3.6vw, 28px)', color: '#fff', textAlign: 'center',
+        padding: '0 28px', marginBottom: '24px', lineHeight: 1.4, opacity: 0.95,
+      }}>Кажи «Да-да-да» — і котик<br />танцюватиме під твій ритм! 💃</div>
+
+      <div style={{
+        fontSize: 'clamp(70px, 22vw, 180px)', marginBottom: '20px',
+        filter: 'drop-shadow(0 8px 14px rgba(0,0,0,0.2))',
+      }}>🐱</div>
+
+      <div style={{
+        background: 'rgba(255,255,255,0.78)', borderRadius: '20px',
+        padding: 'clamp(12px,3vw,22px) clamp(16px,5vw,40px)', maxWidth: '520px',
+        width: '90%', marginBottom: '28px', textAlign: 'center',
+      }}>
+        <div style={{ fontSize: 'clamp(13px,3vw,20px)', color: '#5a3a7a', lineHeight: 1.6 }}>
+          🎤 Дозволь доступ до мікрофона<br />
+          🥁 Промовляй склади: <strong>«да-да-да»</strong><br />
+          💃 Швидше склади — швидше танець!
+        </div>
+      </div>
+
+      <button onClick={onStart} style={btnStyle('#FF6B6B', '#ff8e8e')}>🎵 Почати!</button>
+    </div>
+  );
+}
+
+function PermissionDenied({ onRetry }) {
+  return (
+    <div style={{
+      position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column',
+      alignItems: 'center', justifyContent: 'center',
+      background: 'linear-gradient(160deg, #ffecd2 0%, #fcb69f 100%)', padding: '20px',
+    }}>
+      <div style={{ fontSize: 'clamp(50px, 15vw, 120px)', marginBottom: '16px' }}>🎤</div>
+      <div style={{
+        fontSize: 'clamp(20px, 5vw, 38px)', fontWeight: 'bold', color: '#c0392b',
+        marginBottom: '12px', textAlign: 'center',
+      }}>Мікрофон недоступний</div>
+      <div style={{
+        background: 'rgba(255,255,255,0.7)', borderRadius: '16px', padding: '16px 24px',
+        maxWidth: '480px', width: '90%', marginBottom: '28px',
+        fontSize: 'clamp(13px, 3vw, 20px)', color: '#555', lineHeight: 1.6, textAlign: 'center',
+      }}>
+        Будь ласка, дозвольте доступ до мікрофона<br />
+        у налаштуваннях браузера і спробуйте знову.<br /><br />
+        🔒 Натисніть на іконку замка у адресному рядку.
+      </div>
+      <button onClick={onRetry} style={btnStyle('#2980b9', '#3498db')}>🔄 Спробувати знову</button>
+    </div>
+  );
+}
+
+function TherapistToggle({ active, onToggle }) {
+  return (
+    <button onClick={onToggle} title="Режим логопеда" style={{
+      position: 'absolute', bottom: '16px', right: '16px',
+      background: active ? 'rgba(120,60,160,0.9)' : 'rgba(0,0,0,0.3)', color: '#fff',
+      border: 'none', borderRadius: '50px', padding: '8px 16px', fontSize: '14px',
+      fontFamily: 'inherit', cursor: 'pointer', touchAction: 'manipulation', zIndex: 10,
+    }}>{active ? '🩺 Режим логопеда: ВКЛ' : '🩺'}</button>
+  );
+}
+
+function btnStyle(c1, c2) {
+  return {
+    background: `linear-gradient(145deg, ${c1}, ${c2})`, color: '#fff', border: 'none',
+    borderRadius: '50px', padding: 'clamp(16px,4vw,24px) clamp(40px,10vw,80px)',
+    fontSize: 'clamp(20px,5vw,40px)', fontFamily: 'inherit', fontWeight: 'bold',
+    cursor: 'pointer', boxShadow: `0 6px 20px ${c1}88`, touchAction: 'manipulation',
+  };
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+<!-- Live monitoring for the therapist (active only when ?code= is present) -->
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="../lib/monitor.js"></script>
+</body>
+</html>
