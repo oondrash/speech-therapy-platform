@@ -24,22 +24,23 @@
 const { useState, useEffect, useRef, useCallback } = React;
 
 // ─── Detection tuning for the "Ж" buzz ───────────────────────────────────────
-const RMS_FLOOR       = 0.014;  // ignore quiet background
-const HIGH_RATIO_MIN  = 0.30;   // fraction of energy in the fricative band (ж/ш)
-const VOICING_MIN     = 0.02;   // some low-freq voicing → ж (voiced), not ш
-const CONFIRM_FRAMES  = 2;      // consecutive positives before lift
+const RMS_FLOOR       = 0.02;   // ignore quiet background
+const HIGH_RATIO_MIN  = 0.12;   // fraction of (linear) energy in the fricative band
+const VOICING_MIN     = 0.06;   // some low-freq voicing → ж (voiced), not ш
+const CONFIRM_FRAMES  = 3;      // consecutive positives before lift
 
 // Movement
 const RISE_SPEED  = 0.024;
-const FALL_SPEED  = 0.005;
+const FALL_SPEED  = 0.006;
 const LERP_FACTOR = 0.09;
 const TOP_BOUND    = 0.10;
 const BOTTOM_BOUND = 0.84;
 
 // Flowers / nectar
 const NECTAR_TO_WIN = 5;
-const REACH_RADIUS  = 0.07;     // how close the bee must get to the flower
-const DRINK_MS      = 1200;     // nectar-drinking pause
+const REACH_RADIUS  = 0.085;    // how close the bee must get to the flower
+const FILL_MS       = 5000;     // hold the buzz this long at the flower to fill
+const DRAIN_MS      = 2500;     // the bar drains this fast when the sound stops
 
 const PRAISE = ['Смачно! 🌼', 'Молодець! 🌟', 'Ням-ням! 🍯', 'Чудово! ✨', 'Ще квіточка! 🌸'];
 
@@ -49,21 +50,27 @@ function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 // ─── "Ж" detector (frequency-domain) ─────────────────────────────────────────
 // "Ж" is a sustained VOICED FRICATIVE: lots of high-frequency noise (frication)
 // plus low-frequency voicing. We require both, which separates it from vowels
-// (low high-ratio) and from the unvoiced "Ш" (no voicing).
+// (energy mostly low → small high-ratio) and from the unvoiced "Ш" (no voicing).
+//
+// IMPORTANT: we work in LINEAR POWER (10^(dB/10)). Using the raw dB / byte
+// spectrum makes quiet high-frequency bins look loud, so almost any sound would
+// pass — that was the over-sensitivity bug. Linear power weights real energy.
 function makeZhDetector(sampleRate, fftSize) {
   const binHz = sampleRate / fftSize;
-  function bandSum(freq, loHz, hiHz) {
+  function bandPower(freqDb, loHz, hiHz) {
     let lo = Math.max(1, Math.floor(loHz / binHz));
-    let hi = Math.min(freq.length - 1, Math.ceil(hiHz / binHz));
+    let hi = Math.min(freqDb.length - 1, Math.ceil(hiHz / binHz));
     let s = 0;
-    for (let i = lo; i <= hi; i++) s += freq[i];
+    for (let i = lo; i <= hi; i++) s += Math.pow(10, freqDb[i] / 10); // dB → power
     return s;
   }
-  return function detect(freq, rms) {
+  return function detect(freqDb, rms) {
     if (rms < RMS_FLOOR) return { detected: false, rms, highRatio: 0, voicing: 0 };
-    const total = bandSum(freq, 150, 8000) + 1e-6;
-    const fric  = bandSum(freq, 2600, 7500);   // frication energy (ж/ш)
-    const voic  = bandSum(freq, 120, 450);     // voicing energy (ж, not ш)
+    const lowP  = bandPower(freqDb, 120, 1200);
+    const midP  = bandPower(freqDb, 1200, 2600);
+    const fric  = bandPower(freqDb, 2600, 7800);   // frication energy (ж/ш)
+    const voic  = bandPower(freqDb, 120, 450);     // voicing energy (ж, not ш)
+    const total = lowP + midP + fric + 1e-12;
     const highRatio = fric / total;
     const voicing   = voic / total;
     const detected = highRatio > HIGH_RATIO_MIN && voicing > VOICING_MIN;
@@ -84,7 +91,7 @@ const GROUND_FLOWERS = Array.from({ length: 9 }, (_, i) => ({
 
 // ─── Drawing ─────────────────────────────────────────────────────────────────
 function drawScene(ctx, W, H, s) {
-  const { beeY, detected, rms, highRatio, voicing, flower, drinking,
+  const { beeY, detected, rms, highRatio, voicing, flower, fill, atFlower,
           nectar, sparks, praise, praiseAlpha, clouds, showTherapist } = s;
 
   // sky
@@ -128,15 +135,34 @@ function drawScene(ctx, W, H, s) {
 
   // the target flower (up high)
   const fx = flower.x * W, fy = flower.y * H;
-  // stem hint glow when bee close
   drawFlower(ctx, fx, fy, W * 0.075, flower.color, true);
+
+  // nectar-fill ring around the flower (fills while the child holds the buzz)
+  if (fill > 0) {
+    const rr = W * 0.12;
+    ctx.save();
+    ctx.translate(fx, fy);
+    ctx.lineWidth = W * 0.022; ctx.lineCap = 'round';
+    ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+    ctx.beginPath(); ctx.arc(0, 0, rr, 0, Math.PI * 2); ctx.stroke();
+    ctx.strokeStyle = atFlower ? '#FF8A3D' : '#FFC93C';
+    ctx.beginPath(); ctx.arc(0, 0, rr, -Math.PI/2, -Math.PI/2 + Math.PI*2*clamp(fill,0,1)); ctx.stroke();
+    ctx.restore();
+  }
+  // "hold the buzz!" hint while filling
+  if (atFlower) {
+    ctx.save(); ctx.textAlign = 'center';
+    ctx.font = `bold ${Math.round(W*0.04)}px "Comic Sans MS", cursive`;
+    ctx.fillStyle = '#E8821C'; ctx.strokeStyle = 'rgba(255,255,255,0.8)'; ctx.lineWidth = 4;
+    ctx.strokeText('Тримай Ж-ж-ж!', fx, fy - W*0.16);
+    ctx.fillText('Тримай Ж-ж-ж!', fx, fy - W*0.16);
+    ctx.restore();
+  }
 
   // bee
   const bx = W * 0.42;
   const by = beeY * H;
-  drawBee(ctx, bx, by, detected || drinking > 0, W, s.anim);
-
-  // nectar drinking sparkles handled via sparks below
+  drawBee(ctx, bx, by, detected || atFlower, W, s.anim);
 
   // nectar counter (top center)
   ctx.save();
@@ -318,7 +344,7 @@ function App() {
     beeY: 0.8, targetBeeY: 0.8,
     detected: false, rms: 0, highRatio: 0, voicing: 0,
     flower: { x: 0.42, y: 0.16, color: '#FF6B9D' },
-    drinking: 0, nectar: 0, wonSignaled: false,
+    fill: 0, atFlower: false, nectar: 0, wonSignaled: false,
     sparks: [], praise: null, praiseAlpha: 0,
     anim: { drink: 0 },
     clouds: CLOUDS.map(c => ({ ...c })),
@@ -330,12 +356,12 @@ function App() {
   useEffect(() => { stateRef.current.showTherapist = showTherapist; }, [showTherapist]);
 
   const startAudio = useCallback((analyser) => {
-    const freq = new Uint8Array(analyser.frequencyBinCount);
+    const freq = new Float32Array(analyser.frequencyBinCount);
     const time = new Float32Array(analyser.fftSize);
     const detect = makeZhDetector(analyser.context.sampleRate, analyser.fftSize);
     let confirm = 0;
     timerRef.current = setInterval(() => {
-      analyser.getByteFrequencyData(freq);
+      analyser.getFloatFrequencyData(freq);
       analyser.getFloatTimeDomainData(time);
       let sum = 0; for (let i = 0; i < time.length; i++) sum += time[i]*time[i];
       const rms = Math.sqrt(sum / time.length);
@@ -357,41 +383,41 @@ function App() {
 
     s.clouds.forEach(c => { c.x = (c.x + c.speed*dt) % 1.15; if (c.x > 1.1) c.x = -0.15; });
 
-    if (s.drinking > 0) {
-      // hold at the flower and drink
-      s.drinking -= dt;
-      s.targetBeeY = s.flower.y + REACH_RADIUS * 0.4;
+    // Are we at the flower? Engage when the bee arrives while buzzing;
+    // silence (or losing the buzz) releases it and the bee falls.
+    const bx = 0.42, aspect = W / H;
+    const dx = s.flower.x - bx, dy = (s.flower.y - s.beeY) / aspect;
+    const near = (dx*dx + dy*dy) < REACH_RADIUS*REACH_RADIUS;
+    if (!s.atFlower && near && s.detected) s.atFlower = true;
+    if (s.atFlower && !s.detected) s.atFlower = false;   // sound stopped → let go
+
+    if (s.atFlower) {
+      // Hover locked at the flower and fill the nectar bar — ONLY while buzzing.
+      s.targetBeeY = s.flower.y;
       s.anim.drink = lerp(s.anim.drink, 1, 0.2);
-      // nectar droplets
-      if (Math.random() < 0.4) {
+      s.fill += dt / FILL_MS;
+      if (Math.random() < 0.3) {
         s.sparks.push({ x: s.flower.x*W + (Math.random()-0.5)*W*0.05, y: s.flower.y*H,
           r: 3 + Math.random()*5, alpha: 1, color: '#FFC93C',
           vx: (Math.random()-0.5)*1, vy: -1 - Math.random()*1.5, decay: 0.02 });
       }
-      if (s.drinking <= 0) {
+      if (s.fill >= 1) {
         s.nectar += 1;
         s.praise = PRAISE[(s.nectar-1) % PRAISE.length]; s.praiseAlpha = 1;
-        // celebratory burst
-        for (let i=0;i<20;i++) s.sparks.push({
+        for (let i=0;i<22;i++) s.sparks.push({
           x: s.flower.x*W, y: s.flower.y*H, r: 4+Math.random()*8, alpha:1,
           color: ['#FFC93C','#FF6B9D','#fff'][i%3],
           vx:(Math.random()-0.5)*6, vy:(Math.random()-0.5)*6, decay:0.02 });
-        s.anim.drink = 0;
+        s.fill = 0; s.atFlower = false; s.anim.drink = 0;
         if (s.nectar >= NECTAR_TO_WIN && !s.wonSignaled) { s.wonSignaled = true; setPhase('won'); }
         else s.flower = newFlower();
       }
     } else {
-      // physics: rise on "Ж", gravity otherwise
+      // physics: rise on "Ж", gravity otherwise; the bar drains while not filling
       if (s.detected) s.targetBeeY = Math.max(TOP_BOUND, s.targetBeeY - RISE_SPEED*(dt/16));
       else s.targetBeeY = Math.min(BOTTOM_BOUND, s.targetBeeY + FALL_SPEED*(dt/16));
       s.anim.drink = lerp(s.anim.drink, 0, 0.2);
-
-      // reached flower?
-      const bx = 0.42, aspect = W / H;
-      const dx = s.flower.x - bx, dy = (s.flower.y - s.beeY) / aspect;
-      if (!s.wonSignaled && dx*dx + dy*dy < REACH_RADIUS*REACH_RADIUS) {
-        s.drinking = DRINK_MS;
-      }
+      s.fill = Math.max(0, s.fill - dt / DRAIN_MS);
     }
     s.beeY = lerp(s.beeY, s.targetBeeY, LERP_FACTOR);
 
@@ -434,7 +460,7 @@ function App() {
   const restartGame = useCallback(() => {
     const s = stateRef.current;
     s.beeY = 0.8; s.targetBeeY = 0.8; s.nectar = 0; s.wonSignaled = false;
-    s.drinking = 0; s.sparks = []; s.praise = null; s.praiseAlpha = 0;
+    s.fill = 0; s.atFlower = false; s.sparks = []; s.praise = null; s.praiseAlpha = 0;
     s.flower = newFlower(); s.anim.drink = 0;
     setPhase('playing');
   }, []);
