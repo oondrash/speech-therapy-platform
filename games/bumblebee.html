@@ -340,11 +340,14 @@ function App() {
     y: 0.13 + Math.random() * 0.18,
     color: ['#FF6B9D', '#C780FA', '#FF9F45', '#FF5E7E'][Math.floor(Math.random()*4)],
   });
+  // The opening flower sits low so the very first reach is short and easy;
+  // later flowers (newFlower) climb higher for a gradual ramp.
+  const firstFlower = () => ({ x: 0.42, y: 0.46, color: '#FF6B9D' });
 
   const stateRef = useRef({
     beeY: 0.8, targetBeeY: 0.8,
     detected: false, rms: 0, highRatio: 0, voicing: 0,
-    flower: { x: 0.42, y: 0.16, color: '#FF6B9D' },
+    flower: firstFlower(),
     fill: 0, atFlower: false, grace: 0, nectar: 0, wonSignaled: false,
     sparks: [], praise: null, praiseAlpha: 0,
     anim: { drink: 0 },
@@ -485,7 +488,7 @@ function App() {
     const s = stateRef.current;
     s.beeY = 0.8; s.targetBeeY = 0.8; s.nectar = 0; s.wonSignaled = false;
     s.fill = 0; s.atFlower = false; s.grace = 0; s.sparks = []; s.praise = null; s.praiseAlpha = 0;
-    s.flower = newFlower(); s.anim.drink = 0;
+    s.flower = firstFlower(); s.anim.drink = 0;
     setPhase('playing');
   }, []);
 
