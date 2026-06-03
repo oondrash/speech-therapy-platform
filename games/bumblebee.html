@@ -454,12 +454,12 @@ function App() {
 
   const startGame = useCallback(async () => {
     try {
-      // Disable the browser's voice DSP: autoGainControl quietly turns the mic
-      // down on a sustained buzz (so the bee climbs, then stops responding) and
-      // noiseSuppression strips the high-frequency frication "Ж" lives in. These
-      // are aggressive on phones, mild on desktop — hence the desktop-only bug.
+      // Turn OFF only noiseSuppression — on phones it strips the high-frequency
+      // frication the "Ж" detector lives on. Keep autoGainControl ON: a phone
+      // mic is faint, and without AGC the signal drops below RMS_FLOOR so the
+      // bee never lifts at all.
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+        audio: { noiseSuppression: false, autoGainControl: true, echoCancellation: true },
         video: false,
       });
       const actx = new (window.AudioContext || window.webkitAudioContext)();
