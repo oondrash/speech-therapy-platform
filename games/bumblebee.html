@@ -454,21 +454,26 @@ function App() {
 
   const startGame = useCallback(async () => {
     try {
-      // Turn OFF only noiseSuppression — on phones it strips the high-frequency
-      // frication the "Ж" detector lives on. Keep autoGainControl ON: a phone
-      // mic is faint, and without AGC the signal drops below RMS_FLOOR so the
-      // bee never lifts at all.
+      // All browser voice-DSP OFF: noiseSuppression strips the "Ж" frication,
+      // and autoGainControl rides a steady buzz down until detection dies (a
+      // pulsed "Ж-Ж-Ж" survives, a held "Жжж" doesn't). We instead boost the
+      // (now faint) phone mic ourselves with a fixed GainNode below — a steady
+      // gain that never adapts. The gain scales rms over RMS_FLOOR but leaves
+      // highRatio/voicing untouched, since those are energy *ratios*.
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { noiseSuppression: false, autoGainControl: true, echoCancellation: true },
+        audio: { noiseSuppression: false, autoGainControl: false, echoCancellation: false },
         video: false,
       });
       const actx = new (window.AudioContext || window.webkitAudioContext)();
       if (actx.state === 'suspended') await actx.resume();
       const src = actx.createMediaStreamSource(stream);
+      const gain = actx.createGain();
+      gain.gain.value = 4;            // recover the level AGC used to provide
       const analyser = actx.createAnalyser();
       analyser.fftSize = 2048;
       analyser.smoothingTimeConstant = 0.3;
-      src.connect(analyser);
+      src.connect(gain);
+      gain.connect(analyser);
       audioRef.current = { actx, stream };
       startAudio(analyser);
       setPhase('playing');
