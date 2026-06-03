@@ -37,10 +37,11 @@ const TOP_BOUND    = 0.10;
 const BOTTOM_BOUND = 0.84;
 
 // Flowers / nectar
-const NECTAR_TO_WIN = 5;
+const NECTAR_TO_WIN = 3;
 const REACH_RADIUS  = 0.085;    // how close the bee must get to the flower
 const FILL_MS       = 5000;     // hold the buzz this long at the flower to fill
-const DRAIN_MS      = 2500;     // the bar drains this fast when the sound stops
+const DRAIN_MS      = 4000;     // the bar drains this slowly when truly silent
+const GRACE_MS      = 650;      // tolerate short buzz dropouts without letting go
 
 const PRAISE = ['Смачно! 🌼', 'Молодець! 🌟', 'Ням-ням! 🍯', 'Чудово! ✨', 'Ще квіточка! 🌸'];
 
@@ -69,7 +70,7 @@ function makeZhDetector(sampleRate, fftSize) {
     const lowP  = bandPower(freqDb, 120, 1200);
     const midP  = bandPower(freqDb, 1200, 2600);
     const fric  = bandPower(freqDb, 2600, 7800);   // frication energy (ж/ш)
-    const voic  = bandPower(freqDb, 120, 450);     // voicing energy (ж, not ш)
+    const voic  = bandPower(freqDb, 85, 450);      // voicing energy (ж, not ш) — low pitches too
     const total = lowP + midP + fric + 1e-12;
     const highRatio = fric / total;
     const voicing   = voic / total;
@@ -344,7 +345,7 @@ function App() {
     beeY: 0.8, targetBeeY: 0.8,
     detected: false, rms: 0, highRatio: 0, voicing: 0,
     flower: { x: 0.42, y: 0.16, color: '#FF6B9D' },
-    fill: 0, atFlower: false, nectar: 0, wonSignaled: false,
+    fill: 0, atFlower: false, grace: 0, nectar: 0, wonSignaled: false,
     sparks: [], praise: null, praiseAlpha: 0,
     anim: { drink: 0 },
     clouds: CLOUDS.map(c => ({ ...c })),
@@ -388,29 +389,36 @@ function App() {
     const bx = 0.42, aspect = W / H;
     const dx = s.flower.x - bx, dy = (s.flower.y - s.beeY) / aspect;
     const near = (dx*dx + dy*dy) < REACH_RADIUS*REACH_RADIUS;
-    if (!s.atFlower && near && s.detected) s.atFlower = true;
-    if (s.atFlower && !s.detected) s.atFlower = false;   // sound stopped → let go
+    if (!s.atFlower && near && s.detected) { s.atFlower = true; s.grace = GRACE_MS; }
 
     if (s.atFlower) {
-      // Hover locked at the flower and fill the nectar bar — ONLY while buzzing.
+      // Hover locked at the flower. Brief buzz dropouts (lower pitch, a quick
+      // breath) are tolerated for GRACE_MS so the bee doesn't slip off the flower.
       s.targetBeeY = s.flower.y;
-      s.anim.drink = lerp(s.anim.drink, 1, 0.2);
-      s.fill += dt / FILL_MS;
-      if (Math.random() < 0.3) {
-        s.sparks.push({ x: s.flower.x*W + (Math.random()-0.5)*W*0.05, y: s.flower.y*H,
-          r: 3 + Math.random()*5, alpha: 1, color: '#FFC93C',
-          vx: (Math.random()-0.5)*1, vy: -1 - Math.random()*1.5, decay: 0.02 });
-      }
-      if (s.fill >= 1) {
-        s.nectar += 1;
-        s.praise = PRAISE[(s.nectar-1) % PRAISE.length]; s.praiseAlpha = 1;
-        for (let i=0;i<22;i++) s.sparks.push({
-          x: s.flower.x*W, y: s.flower.y*H, r: 4+Math.random()*8, alpha:1,
-          color: ['#FFC93C','#FF6B9D','#fff'][i%3],
-          vx:(Math.random()-0.5)*6, vy:(Math.random()-0.5)*6, decay:0.02 });
-        s.fill = 0; s.atFlower = false; s.anim.drink = 0;
-        if (s.nectar >= NECTAR_TO_WIN && !s.wonSignaled) { s.wonSignaled = true; setPhase('won'); }
-        else s.flower = newFlower();
+      if (s.detected) {
+        s.grace = GRACE_MS;
+        s.anim.drink = lerp(s.anim.drink, 1, 0.2);
+        s.fill += dt / FILL_MS;
+        if (Math.random() < 0.3) {
+          s.sparks.push({ x: s.flower.x*W + (Math.random()-0.5)*W*0.05, y: s.flower.y*H,
+            r: 3 + Math.random()*5, alpha: 1, color: '#FFC93C',
+            vx: (Math.random()-0.5)*1, vy: -1 - Math.random()*1.5, decay: 0.02 });
+        }
+        if (s.fill >= 1) {
+          s.nectar += 1;
+          s.praise = PRAISE[(s.nectar-1) % PRAISE.length]; s.praiseAlpha = 1;
+          for (let i=0;i<22;i++) s.sparks.push({
+            x: s.flower.x*W, y: s.flower.y*H, r: 4+Math.random()*8, alpha:1,
+            color: ['#FFC93C','#FF6B9D','#fff'][i%3],
+            vx:(Math.random()-0.5)*6, vy:(Math.random()-0.5)*6, decay:0.02 });
+          s.fill = 0; s.atFlower = false; s.anim.drink = 0;
+          if (s.nectar >= NECTAR_TO_WIN && !s.wonSignaled) { s.wonSignaled = true; setPhase('won'); }
+          else s.flower = newFlower();
+        }
+      } else {
+        // Dropout: hold position, pause the bar (no drain), burn grace. Let go at 0.
+        s.grace -= dt;
+        if (s.grace <= 0) s.atFlower = false;
       }
     } else {
       // physics: rise on "Ж", gravity otherwise; the bar drains while not filling
@@ -460,7 +468,7 @@ function App() {
   const restartGame = useCallback(() => {
     const s = stateRef.current;
     s.beeY = 0.8; s.targetBeeY = 0.8; s.nectar = 0; s.wonSignaled = false;
-    s.fill = 0; s.atFlower = false; s.sparks = []; s.praise = null; s.praiseAlpha = 0;
+    s.fill = 0; s.atFlower = false; s.grace = 0; s.sparks = []; s.praise = null; s.praiseAlpha = 0;
     s.flower = newFlower(); s.anim.drink = 0;
     setPhase('playing');
   }, []);
