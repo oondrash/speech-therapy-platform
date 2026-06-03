@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Джміль — вчимо звук Ж</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body, #root { width: 100%; height: 100%; overflow: hidden; }
+    body {
+      font-family: 'Comic Sans MS', 'Chalkboard SE', 'Arial Rounded MT Bold', cursive;
+      touch-action: none; user-select: none; -webkit-user-select: none;
+    }
+    canvas { display: block; }
+    #root { position: relative; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ─── Detection tuning for the "Ж" buzz ───────────────────────────────────────
+const RMS_FLOOR       = 0.014;  // ignore quiet background
+const HIGH_RATIO_MIN  = 0.30;   // fraction of energy in the fricative band (ж/ш)
+const VOICING_MIN     = 0.02;   // some low-freq voicing → ж (voiced), not ш
+const CONFIRM_FRAMES  = 2;      // consecutive positives before lift
+
+// Movement
+const RISE_SPEED  = 0.024;
+const FALL_SPEED  = 0.005;
+const LERP_FACTOR = 0.09;
+const TOP_BOUND    = 0.10;
+const BOTTOM_BOUND = 0.84;
+
+// Flowers / nectar
+const NECTAR_TO_WIN = 5;
+const REACH_RADIUS  = 0.07;     // how close the bee must get to the flower
+const DRINK_MS      = 1200;     // nectar-drinking pause
+
+const PRAISE = ['Смачно! 🌼', 'Молодець! 🌟', 'Ням-ням! 🍯', 'Чудово! ✨', 'Ще квіточка! 🌸'];
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+// ─── "Ж" detector (frequency-domain) ─────────────────────────────────────────
+// "Ж" is a sustained VOICED FRICATIVE: lots of high-frequency noise (frication)
+// plus low-frequency voicing. We require both, which separates it from vowels
+// (low high-ratio) and from the unvoiced "Ш" (no voicing).
+function makeZhDetector(sampleRate, fftSize) {
+  const binHz = sampleRate / fftSize;
+  function bandSum(freq, loHz, hiHz) {
+    let lo = Math.max(1, Math.floor(loHz / binHz));
+    let hi = Math.min(freq.length - 1, Math.ceil(hiHz / binHz));
+    let s = 0;
+    for (let i = lo; i <= hi; i++) s += freq[i];
+    return s;
+  }
+  return function detect(freq, rms) {
+    if (rms < RMS_FLOOR) return { detected: false, rms, highRatio: 0, voicing: 0 };
+    const total = bandSum(freq, 150, 8000) + 1e-6;
+    const fric  = bandSum(freq, 2600, 7500);   // frication energy (ж/ш)
+    const voic  = bandSum(freq, 120, 450);     // voicing energy (ж, not ш)
+    const highRatio = fric / total;
+    const voicing   = voic / total;
+    const detected = highRatio > HIGH_RATIO_MIN && voicing > VOICING_MIN;
+    return { detected, rms, highRatio, voicing };
+  };
+}
+
+// ─── Static background décor ─────────────────────────────────────────────────
+const CLOUDS = Array.from({ length: 4 }, (_, i) => ({
+  x: 0.1 + Math.random() * 0.8, y: 0.06 + Math.random() * 0.18,
+  scale: 0.6 + Math.random() * 0.7, speed: 0.00006 + Math.random() * 0.00008,
+}));
+const GROUND_FLOWERS = Array.from({ length: 9 }, (_, i) => ({
+  x: 0.04 + i * 0.11 + Math.random() * 0.03,
+  color: ['#FF6B9D', '#FFD93D', '#C780FA', '#FF9F45', '#6BCB77'][i % 5],
+  h: 0.04 + Math.random() * 0.05,
+}));
+
+// ─── Drawing ─────────────────────────────────────────────────────────────────
+function drawScene(ctx, W, H, s) {
+  const { beeY, detected, rms, highRatio, voicing, flower, drinking,
+          nectar, sparks, praise, praiseAlpha, clouds, showTherapist } = s;
+
+  // sky
+  const sky = ctx.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0, '#8FD3FF'); sky.addColorStop(1, '#D6F3FF');
+  ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+
+  // sun
+  ctx.save();
+  const sunG = ctx.createRadialGradient(W * 0.85, H * 0.13, 0, W * 0.85, H * 0.13, W * 0.16);
+  sunG.addColorStop(0, 'rgba(255,240,150,0.95)'); sunG.addColorStop(1, 'rgba(255,240,150,0)');
+  ctx.fillStyle = sunG; ctx.fillRect(W * 0.6, 0, W * 0.4, H * 0.35);
+  ctx.fillStyle = '#FFE65C';
+  ctx.beginPath(); ctx.arc(W * 0.85, H * 0.13, W * 0.06, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+
+  // clouds
+  clouds.forEach(c => drawCloud(ctx, c.x * W, c.y * H, c.scale, W));
+
+  // ground
+  const grassH = H * 0.14;
+  const gg = ctx.createLinearGradient(0, H - grassH, 0, H);
+  gg.addColorStop(0, '#7ED957'); gg.addColorStop(1, '#5BA83C');
+  ctx.fillStyle = gg; ctx.fillRect(0, H - grassH, W, grassH);
+
+  // ground flowers
+  GROUND_FLOWERS.forEach(f => {
+    const fx = f.x * W, baseY = H - grassH;
+    ctx.strokeStyle = '#3f8b34'; ctx.lineWidth = W * 0.006;
+    ctx.beginPath(); ctx.moveTo(fx, baseY); ctx.lineTo(fx, baseY - f.h * H); ctx.stroke();
+    drawFlower(ctx, fx, baseY - f.h * H, W * 0.035, f.color, false);
+  });
+
+  // altitude bar (right)
+  const barH = H * 0.66, barY = H * 0.16, barX = W - 20;
+  ctx.fillStyle = 'rgba(0,0,0,0.12)';
+  roundRect(ctx, barX - 6, barY, 14, barH, 7); ctx.fill();
+  ctx.fillStyle = detected ? 'rgba(255,200,40,0.9)' : 'rgba(170,170,170,0.6)';
+  const fillH = barH * (1 - beeY);
+  roundRect(ctx, barX - 6, barY + barH - fillH, 14, fillH, 7); ctx.fill();
+
+  // the target flower (up high)
+  const fx = flower.x * W, fy = flower.y * H;
+  // stem hint glow when bee close
+  drawFlower(ctx, fx, fy, W * 0.075, flower.color, true);
+
+  // bee
+  const bx = W * 0.42;
+  const by = beeY * H;
+  drawBee(ctx, bx, by, detected || drinking > 0, W, s.anim);
+
+  // nectar drinking sparkles handled via sparks below
+
+  // nectar counter (top center)
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.font = `bold ${Math.round(W * 0.05)}px "Comic Sans MS", cursive`;
+  ctx.fillStyle = '#fff'; ctx.strokeStyle = 'rgba(120,90,30,0.7)'; ctx.lineWidth = 5;
+  const txt = `🍯 ${nectar} / ${NECTAR_TO_WIN}`;
+  ctx.strokeText(txt, W * 0.5, H * 0.085); ctx.fillText(txt, W * 0.5, H * 0.085);
+  ctx.restore();
+  for (let i = 0; i < NECTAR_TO_WIN; i++) {
+    const px = W * 0.5 + (i - (NECTAR_TO_WIN - 1) / 2) * W * 0.058;
+    drawFlower(ctx, px, H * 0.125, W * 0.016, i < nectar ? '#FF6B9D' : 'rgba(255,255,255,0.5)', false);
+  }
+
+  // sparks
+  sparks.forEach(p => {
+    ctx.save(); ctx.globalAlpha = p.alpha;
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  });
+
+  // praise
+  if (praise && praiseAlpha > 0) {
+    ctx.save(); ctx.globalAlpha = praiseAlpha; ctx.textAlign = 'center';
+    ctx.font = `bold ${Math.round(W * 0.07)}px "Comic Sans MS", cursive`;
+    ctx.fillStyle = '#FF8A3D'; ctx.strokeStyle = 'rgba(255,255,255,0.8)'; ctx.lineWidth = 5;
+    ctx.strokeText(praise, W * 0.5, H * 0.3); ctx.fillText(praise, W * 0.5, H * 0.3);
+    ctx.restore();
+  }
+
+  // mic level + buzz hint (bottom-left)
+  const mbW = W * 0.32, mbH = 18, mbX = 16, mbY = H - grassH - mbH - 12;
+  ctx.fillStyle = 'rgba(0,0,0,0.2)'; roundRect(ctx, mbX, mbY, mbW, mbH, 9); ctx.fill();
+  ctx.fillStyle = detected ? '#FFC107' : '#4D96FF';
+  roundRect(ctx, mbX, mbY, mbW * clamp(rms / 0.25, 0, 1), mbH, 9); ctx.fill();
+  ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.font = `${Math.round(mbH * 0.85)}px sans-serif`;
+  ctx.textAlign = 'left'; ctx.fillText('🎤', mbX + mbW + 6, mbY + mbH - 1);
+
+  // therapist overlay
+  if (showTherapist) {
+    ctx.save(); ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    roundRect(ctx, 10, 10, 230, 100, 12); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.font = '13px monospace'; ctx.textAlign = 'left';
+    ctx.fillText(`RMS:   ${rms.toFixed(4)}`, 20, 32);
+    ctx.fillText(`ВЧ-частка: ${highRatio.toFixed(2)} (>${HIGH_RATIO_MIN})`, 20, 52);
+    ctx.fillText(`Голос: ${voicing.toFixed(2)} (>${VOICING_MIN})`, 20, 72);
+    ctx.fillText(`Звук Ж: ${detected ? '✓ ТАК' : '✗ ні'}`, 20, 92);
+    ctx.restore();
+  }
+}
+
+function drawCloud(ctx, cx, cy, scale, W) {
+  const r = W * 0.05 * scale;
+  ctx.save(); ctx.fillStyle = 'rgba(255,255,255,0.92)';
+  [[0,0,r],[-r*0.8,r*0.2,r*0.7],[r*0.8,r*0.2,r*0.7],[-r*0.35,-r*0.45,r*0.6],[r*0.4,-r*0.4,r*0.55]]
+    .forEach(([dx,dy,rad])=>{ ctx.beginPath(); ctx.arc(cx+dx,cy+dy,rad,0,Math.PI*2); ctx.fill(); });
+  ctx.restore();
+}
+
+function drawFlower(ctx, cx, cy, r, color, glow) {
+  const t = Date.now();
+  ctx.save(); ctx.translate(cx, cy);
+  if (glow) {
+    ctx.save(); ctx.globalAlpha = 0.3 + Math.sin(t/250)*0.12;
+    const g = ctx.createRadialGradient(0,0,0,0,0,r*2.2);
+    g.addColorStop(0,'rgba(255,240,150,0.9)'); g.addColorStop(1,'rgba(255,240,150,0)');
+    ctx.fillStyle=g; ctx.beginPath(); ctx.arc(0,0,r*2.2,0,Math.PI*2); ctx.fill(); ctx.restore();
+  }
+  // petals
+  const petals = 6;
+  ctx.fillStyle = color;
+  for (let i = 0; i < petals; i++) {
+    const a = (Math.PI*2/petals)*i + (glow ? Math.sin(t/600)*0.05 : 0);
+    const px = Math.cos(a)*r*0.95, py = Math.sin(a)*r*0.95;
+    ctx.beginPath(); ctx.ellipse(px, py, r*0.62, r*0.42, a, 0, Math.PI*2); ctx.fill();
+  }
+  // center
+  ctx.fillStyle = '#FFC93C';
+  ctx.beginPath(); ctx.arc(0,0,r*0.5,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#E8A317';
+  for (let i=0;i<6;i++){ const a=(Math.PI*2/6)*i; ctx.beginPath(); ctx.arc(Math.cos(a)*r*0.2,Math.sin(a)*r*0.2,r*0.07,0,Math.PI*2); ctx.fill(); }
+  ctx.restore();
+}
+
+function drawBee(ctx, cx, cy, active, W, anim) {
+  const s = W * 0.085;
+  const t = Date.now();
+  const bob = Math.sin(t/180) * s * 0.06;
+  ctx.save();
+  ctx.translate(cx, cy + bob);
+
+  // shadow
+  ctx.save(); ctx.globalAlpha = 0.12; ctx.fillStyle='#000';
+  ctx.beginPath(); ctx.ellipse(0, s*0.9, s*0.7, s*0.14, 0, 0, Math.PI*2); ctx.fill(); ctx.restore();
+
+  // wings (flap faster when buzzing)
+  const flap = Math.sin(t / (active ? 22 : 60));
+  ctx.save();
+  ctx.globalAlpha = 0.7;
+  ctx.fillStyle = 'rgba(220,240,255,0.85)';
+  ctx.strokeStyle = 'rgba(150,190,220,0.8)'; ctx.lineWidth = s*0.03;
+  [[-1],[1]].forEach(([side])=>{
+    ctx.save();
+    ctx.translate(side*s*0.25, -s*0.45);
+    ctx.rotate(side * (0.5 + flap*0.35));
+    ctx.beginPath(); ctx.ellipse(side*s*0.5, 0, s*0.55, s*0.28, 0, 0, Math.PI*2);
+    ctx.fill(); ctx.stroke();
+    ctx.restore();
+  });
+  ctx.restore();
+
+  // body (striped)
+  ctx.save();
+  ctx.rotate(Math.sin(t/300)*0.05);
+  // base yellow
+  const bg = ctx.createLinearGradient(0,-s*0.5,0,s*0.6);
+  bg.addColorStop(0,'#FFD54A'); bg.addColorStop(1,'#F5A623');
+  ctx.fillStyle = bg;
+  ctx.beginPath(); ctx.ellipse(0, 0, s*0.62, s*0.78, 0, 0, Math.PI*2); ctx.fill();
+  // black stripes (clipped to body)
+  ctx.save();
+  ctx.beginPath(); ctx.ellipse(0,0,s*0.62,s*0.78,0,0,Math.PI*2); ctx.clip();
+  ctx.fillStyle = '#3a2c1a';
+  [-0.28, 0.12, 0.5].forEach(yy=>{ ctx.fillRect(-s*0.7, yy*s - s*0.09, s*1.4, s*0.18); });
+  ctx.restore();
+  // stinger
+  ctx.fillStyle = '#3a2c1a';
+  ctx.beginPath(); ctx.moveTo(0, s*0.78); ctx.lineTo(-s*0.08, s*0.62); ctx.lineTo(s*0.08, s*0.62); ctx.closePath(); ctx.fill();
+
+  // head
+  ctx.fillStyle = '#3a2c1a';
+  ctx.beginPath(); ctx.arc(0, -s*0.72, s*0.34, 0, Math.PI*2); ctx.fill();
+  // antennae
+  ctx.strokeStyle = '#3a2c1a'; ctx.lineWidth = s*0.05; ctx.lineCap='round';
+  [[-1],[1]].forEach(([side])=>{
+    ctx.beginPath(); ctx.moveTo(side*s*0.1, -s*0.95);
+    ctx.quadraticCurveTo(side*s*0.28, -s*1.2, side*s*0.2, -s*1.32); ctx.stroke();
+    ctx.fillStyle='#3a2c1a'; ctx.beginPath(); ctx.arc(side*s*0.2,-s*1.34,s*0.06,0,Math.PI*2); ctx.fill();
+  });
+  // eyes
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(-s*0.13,-s*0.74,s*0.1,0,Math.PI*2); ctx.arc(s*0.13,-s*0.74,s*0.1,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#1a1208';
+  ctx.beginPath(); ctx.arc(-s*0.11,-s*0.73,s*0.05,0,Math.PI*2); ctx.arc(s*0.15,-s*0.73,s*0.05,0,Math.PI*2); ctx.fill();
+  // smile
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = s*0.035;
+  ctx.beginPath(); ctx.arc(0,-s*0.62,s*0.12,0.15*Math.PI,0.85*Math.PI); ctx.stroke();
+
+  // tongue when drinking
+  if (anim && anim.drink > 0) {
+    ctx.strokeStyle = '#FF8FB0'; ctx.lineWidth = s*0.06; ctx.lineCap='round';
+    ctx.beginPath(); ctx.moveTo(0,-s*0.5); ctx.lineTo(0,-s*0.5 - anim.drink*s*0.9); ctx.stroke();
+  }
+  ctx.restore();
+  ctx.restore();
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+}
+
+// ─── App ─────────────────────────────────────────────────────────────────────
+function App() {
+  const canvasRef = useRef(null);
+  const audioRef = useRef(null);
+  const rafRef = useRef(null);
+  const timerRef = useRef(null);
+
+  const newFlower = () => ({
+    x: 0.42 + (Math.random() - 0.5) * 0.06,
+    y: 0.13 + Math.random() * 0.18,
+    color: ['#FF6B9D', '#C780FA', '#FF9F45', '#FF5E7E'][Math.floor(Math.random()*4)],
+  });
+
+  const stateRef = useRef({
+    beeY: 0.8, targetBeeY: 0.8,
+    detected: false, rms: 0, highRatio: 0, voicing: 0,
+    flower: { x: 0.42, y: 0.16, color: '#FF6B9D' },
+    drinking: 0, nectar: 0, wonSignaled: false,
+    sparks: [], praise: null, praiseAlpha: 0,
+    anim: { drink: 0 },
+    clouds: CLOUDS.map(c => ({ ...c })),
+    lastTime: 0, showTherapist: false,
+  });
+
+  const [phase, setPhase] = useState('start');
+  const [showTherapist, setShowTherapist] = useState(false);
+  useEffect(() => { stateRef.current.showTherapist = showTherapist; }, [showTherapist]);
+
+  const startAudio = useCallback((analyser) => {
+    const freq = new Uint8Array(analyser.frequencyBinCount);
+    const time = new Float32Array(analyser.fftSize);
+    const detect = makeZhDetector(analyser.context.sampleRate, analyser.fftSize);
+    let confirm = 0;
+    timerRef.current = setInterval(() => {
+      analyser.getByteFrequencyData(freq);
+      analyser.getFloatTimeDomainData(time);
+      let sum = 0; for (let i = 0; i < time.length; i++) sum += time[i]*time[i];
+      const rms = Math.sqrt(sum / time.length);
+      const r = detect(freq, rms);
+      if (r.detected) confirm = Math.min(confirm + 1, CONFIRM_FRAMES); else confirm = 0;
+      const s = stateRef.current;
+      s.detected = confirm >= CONFIRM_FRAMES;
+      s.rms = r.rms; s.highRatio = r.highRatio; s.voicing = r.voicing;
+    }, 20);
+  }, []);
+
+  const animate = useCallback((now) => {
+    const canvas = canvasRef.current; if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    const s = stateRef.current;
+    const dt = s.lastTime ? Math.min(now - s.lastTime, 50) : 16;
+    s.lastTime = now;
+
+    s.clouds.forEach(c => { c.x = (c.x + c.speed*dt) % 1.15; if (c.x > 1.1) c.x = -0.15; });
+
+    if (s.drinking > 0) {
+      // hold at the flower and drink
+      s.drinking -= dt;
+      s.targetBeeY = s.flower.y + REACH_RADIUS * 0.4;
+      s.anim.drink = lerp(s.anim.drink, 1, 0.2);
+      // nectar droplets
+      if (Math.random() < 0.4) {
+        s.sparks.push({ x: s.flower.x*W + (Math.random()-0.5)*W*0.05, y: s.flower.y*H,
+          r: 3 + Math.random()*5, alpha: 1, color: '#FFC93C',
+          vx: (Math.random()-0.5)*1, vy: -1 - Math.random()*1.5, decay: 0.02 });
+      }
+      if (s.drinking <= 0) {
+        s.nectar += 1;
+        s.praise = PRAISE[(s.nectar-1) % PRAISE.length]; s.praiseAlpha = 1;
+        // celebratory burst
+        for (let i=0;i<20;i++) s.sparks.push({
+          x: s.flower.x*W, y: s.flower.y*H, r: 4+Math.random()*8, alpha:1,
+          color: ['#FFC93C','#FF6B9D','#fff'][i%3],
+          vx:(Math.random()-0.5)*6, vy:(Math.random()-0.5)*6, decay:0.02 });
+        s.anim.drink = 0;
+        if (s.nectar >= NECTAR_TO_WIN && !s.wonSignaled) { s.wonSignaled = true; setPhase('won'); }
+        else s.flower = newFlower();
+      }
+    } else {
+      // physics: rise on "Ж", gravity otherwise
+      if (s.detected) s.targetBeeY = Math.max(TOP_BOUND, s.targetBeeY - RISE_SPEED*(dt/16));
+      else s.targetBeeY = Math.min(BOTTOM_BOUND, s.targetBeeY + FALL_SPEED*(dt/16));
+      s.anim.drink = lerp(s.anim.drink, 0, 0.2);
+
+      // reached flower?
+      const bx = 0.42, aspect = W / H;
+      const dx = s.flower.x - bx, dy = (s.flower.y - s.beeY) / aspect;
+      if (!s.wonSignaled && dx*dx + dy*dy < REACH_RADIUS*REACH_RADIUS) {
+        s.drinking = DRINK_MS;
+      }
+    }
+    s.beeY = lerp(s.beeY, s.targetBeeY, LERP_FACTOR);
+
+    // particles
+    s.sparks = s.sparks.map(p => ({ ...p, x:p.x+p.vx, y:p.y+p.vy, alpha:p.alpha-p.decay }))
+      .filter(p => p.alpha > 0);
+    if (s.praiseAlpha > 0) s.praiseAlpha = Math.max(0, s.praiseAlpha - 0.01);
+
+    drawScene(ctx, W, H, s);
+
+    window.__telemetry = {
+      game: '🐝 Джміль',
+      primaryLabel: 'Нектар 🍯',
+      primary: s.nectar + ' / ' + NECTAR_TO_WIN,
+      detect: s.detected,
+      level: s.rms,
+      extra: s.detected ? 'звук Ж' : '',
+    };
+
+    rafRef.current = requestAnimationFrame(animate);
+  }, []);
+
+  const startGame = useCallback(async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      const actx = new (window.AudioContext || window.webkitAudioContext)();
+      if (actx.state === 'suspended') await actx.resume();
+      const src = actx.createMediaStreamSource(stream);
+      const analyser = actx.createAnalyser();
+      analyser.fftSize = 2048;
+      analyser.smoothingTimeConstant = 0.3;
+      src.connect(analyser);
+      audioRef.current = { actx, stream };
+      startAudio(analyser);
+      setPhase('playing');
+      rafRef.current = requestAnimationFrame(animate);
+    } catch (e) { console.error(e); setPhase('denied'); }
+  }, [animate, startAudio]);
+
+  const restartGame = useCallback(() => {
+    const s = stateRef.current;
+    s.beeY = 0.8; s.targetBeeY = 0.8; s.nectar = 0; s.wonSignaled = false;
+    s.drinking = 0; s.sparks = []; s.praise = null; s.praiseAlpha = 0;
+    s.flower = newFlower(); s.anim.drink = 0;
+    setPhase('playing');
+  }, []);
+
+  useEffect(() => {
+    const canvas = canvasRef.current; if (!canvas) return;
+    const resize = () => { canvas.width = window.innerWidth; canvas.height = window.innerHeight; };
+    resize(); window.addEventListener('resize', resize);
+    return () => window.removeEventListener('resize', resize);
+  }, []);
+
+  useEffect(() => () => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    if (timerRef.current) clearInterval(timerRef.current);
+    if (audioRef.current) { audioRef.current.stream.getTracks().forEach(t=>t.stop()); audioRef.current.actx.close(); }
+  }, []);
+
+  return (
+    <div style={{ width:'100%', height:'100%', position:'relative' }}>
+      <canvas ref={canvasRef} style={{ position:'absolute', inset:0 }} />
+      {phase === 'start' && <StartScreen onStart={startGame} />}
+      {phase === 'denied' && <PermissionDenied onRetry={startGame} />}
+      {phase === 'playing' && <TherapistToggle active={showTherapist} onToggle={()=>setShowTherapist(v=>!v)} />}
+      {phase === 'won' && <WinScreen onRestart={restartGame} />}
+    </div>
+  );
+}
+
+// ─── Screens ─────────────────────────────────────────────────────────────────
+function StartScreen({ onStart }) {
+  return (
+    <div style={screenBg('linear-gradient(160deg, #8FD3FF 0%, #C6F0B6 100%)')}>
+      <div style={{ fontSize:'clamp(26px,7vw,58px)', fontWeight:'bold', color:'#5a8c2a',
+        textShadow:'2px 3px 0 rgba(255,255,255,0.7)', textAlign:'center', padding:'0 20px' }}>
+        🐝 Джміль
+      </div>
+      <div style={{ fontSize:'clamp(14px,3.6vw,26px)', color:'#3f7a2a', textAlign:'center',
+        padding:'0 30px', marginTop:'6px', marginBottom:'18px', lineHeight:1.4 }}>
+        Дзижчи «Ж-ж-ж» — і джміль<br />полетить до квіточки! 🌸
+      </div>
+      <div style={{ fontSize:'clamp(70px,20vw,150px)', marginBottom:'18px',
+        filter:'drop-shadow(0 8px 12px rgba(0,0,0,0.15))' }}>🐝</div>
+      <div style={{ background:'rgba(255,255,255,0.8)', borderRadius:'20px',
+        padding:'clamp(12px,3vw,22px) clamp(16px,5vw,40px)', maxWidth:'520px', width:'90%',
+        marginBottom:'26px', textAlign:'center' }}>
+        <div style={{ fontSize:'clamp(13px,3vw,20px)', color:'#4a6a2a', lineHeight:1.6 }}>
+          🎤 Дозволь доступ до мікрофона<br />
+          🐝 Дзижчи довге <strong>«Ж-ж-ж-ж»</strong><br />
+          🍯 Долети до квітки й попий нектар!
+        </div>
+      </div>
+      <button onClick={onStart} style={btn('#FFB02E','#FFC85C')}>🌼 Почати!</button>
+    </div>
+  );
+}
+function PermissionDenied({ onRetry }) {
+  return (
+    <div style={screenBg('linear-gradient(160deg, #ffecd2 0%, #fcb69f 100%)')}>
+      <div style={{ fontSize:'clamp(50px,15vw,120px)', marginBottom:'16px' }}>🎤</div>
+      <div style={{ fontSize:'clamp(20px,5vw,38px)', fontWeight:'bold', color:'#c0392b',
+        marginBottom:'12px', textAlign:'center' }}>Мікрофон недоступний</div>
+      <div style={{ background:'rgba(255,255,255,0.7)', borderRadius:'16px', padding:'16px 24px',
+        maxWidth:'460px', width:'90%', marginBottom:'26px', fontSize:'clamp(13px,3vw,20px)',
+        color:'#555', lineHeight:1.6, textAlign:'center' }}>
+        Дозволь доступ до мікрофона у браузері<br />🔒 (іконка замка в адресному рядку) і спробуй ще.
+      </div>
+      <button onClick={onRetry} style={btn('#2980b9','#3498db')}>🔄 Спробувати знову</button>
+    </div>
+  );
+}
+function WinScreen({ onRestart }) {
+  return (
+    <div style={screenBg('radial-gradient(circle at 50% 35%, rgba(255,255,255,0.85), rgba(150,210,140,0.92))')}>
+      <div style={{ fontSize:'clamp(48px,13vw,120px)', marginBottom:'6px' }}>🎉🐝🌻</div>
+      <div style={{ fontSize:'clamp(26px,7vw,60px)' }}>🍯🍯🍯🍯🍯</div>
+      <div style={{ fontSize:'clamp(26px,7vw,60px)', fontWeight:'bold', color:'#E8821C',
+        textShadow:'2px 3px 0 rgba(255,255,255,0.8)', textAlign:'center', margin:'8px 0' }}>Молодець! 🌟</div>
+      <div style={{ fontSize:'clamp(16px,4vw,30px)', color:'#3f7a2a', textAlign:'center',
+        marginBottom:'30px' }}>Джміль зібрав увесь нектар!</div>
+      <button onClick={onRestart} style={btn('#FFB02E','#FFC85C')}>🔄 Ще раз!</button>
+    </div>
+  );
+}
+function TherapistToggle({ active, onToggle }) {
+  return (
+    <button onClick={onToggle} title="Режим логопеда" style={{
+      position:'absolute', bottom:'16px', right:'16px',
+      background: active ? 'rgba(120,90,30,0.9)' : 'rgba(0,0,0,0.3)', color:'#fff', border:'none',
+      borderRadius:'50px', padding:'8px 16px', fontSize:'14px', fontFamily:'inherit',
+      cursor:'pointer', touchAction:'manipulation', zIndex:10 }}>
+      {active ? '🩺 Режим логопеда: ВКЛ' : '🩺'}
+    </button>
+  );
+}
+function screenBg(bg) {
+  return { position:'absolute', inset:0, display:'flex', flexDirection:'column',
+    alignItems:'center', justifyContent:'center', background:bg, padding:'20px' };
+}
+function btn(c1, c2) {
+  return { background:`linear-gradient(145deg, ${c1}, ${c2})`, color:'#fff', border:'none',
+    borderRadius:'50px', padding:'clamp(16px,4vw,24px) clamp(40px,10vw,80px)',
+    fontSize:'clamp(20px,5vw,40px)', fontFamily:'inherit', fontWeight:'bold',
+    cursor:'pointer', boxShadow:`0 6px 20px ${c1}88`, touchAction:'manipulation' };
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+<!-- Live monitoring for the therapist (active only when ?code= is present) -->
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="../lib/ice-config.js"></script>
+<script src="../lib/monitor.js"></script>
+</body>
+</html>
