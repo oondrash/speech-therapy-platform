@@ -249,9 +249,9 @@ function drawSnake(ctx, W, H, phase, swallows, crawling) {
     // bulb head, thick body, tapered tail
     let r = rMax * (1.0 - 0.78 * t);
     if (t < 0.05) r = rMax * (0.9 + t/0.05*0.12);
-    // swallowed-apple bulges
+    // swallowed-apple bulges (sized to roughly match the apple, not dwarf it)
     for (const sw of swallows) {
-      r += rMax * 1.35 * Math.exp(-Math.pow((t - sw.p) / 0.07, 2));
+      r += rMax * 0.6 * Math.exp(-Math.pow((t - sw.p) / 0.06, 2));
     }
     return Math.max(rMax * 0.18, r);
   }
