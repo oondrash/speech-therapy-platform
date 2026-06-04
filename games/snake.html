@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Змійка — вчимо звук С</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body, #root { width: 100%; height: 100%; overflow: hidden; }
+    body {
+      font-family: 'Comic Sans MS', 'Chalkboard SE', 'Arial Rounded MT Bold', cursive;
+      touch-action: none; user-select: none; -webkit-user-select: none;
+    }
+    canvas { display: block; }
+    #root { position: relative; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ─── Detection tuning for the "С" whistle ─────────────────────────────────────
+const RMS_FLOOR      = 0.02;   // ignore quiet background
+const FRIC_MIN       = 0.45;   // share of energy that must be fricative (vs vowels)
+const S_SHARE_MIN    = 0.42;   // of the fricative energy, how much sits in the high "с" band
+const CONFIRM_FRAMES = 2;      // consecutive positives before the snake crawls
+
+// World / movement (horizontal scroller)
+const HEAD_X    = 0.42;        // the snake's head stays here on screen
+const GROUND_Y  = 0.80;
+const SPEED     = 0.0040;      // world advance per 16ms while hissing
+const CRAWL     = 0.22;        // slither phase speed
+const AHEAD     = 0.46;        // how far in front the next apple spawns
+const FIRST_AHEAD = 0.34;      // first apple a little closer for an easy start
+const SWALLOW_MS = 1300;       // time for a swallowed apple to travel down the body
+
+const APPLES_TO_WIN = 3;
+
+const PRAISE = ['Ням! 🍎', 'Смачно! 😋', 'Молодець! 🌟', 'Ще яблучко! 🍏', 'Чудово! ✨'];
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+// ─── "С" detector (frequency-domain) ──────────────────────────────────────────
+// "С", "Ш" and "Х" are ALL unvoiced fricatives full of high-frequency noise, so
+// "is there hiss?" can't tell them apart. What separates them is WHERE the
+// frication sits:
+//   • "Х" — diffuse, lower (≈0.9–1.8 kHz)
+//   • "Ш" — mid-high (≈1.8–4.5 kHz)
+//   • "С" — highest, a sharp whistle (≈4.5–9.5 kHz)  ← we want this
+// So we require enough total frication (rejects vowels) AND that it is
+// concentrated in the high "с" band (rejects "Ш" below and "Х" lower still).
+//
+// IMPORTANT: linear power (10^(dB/10)); the raw dB spectrum makes quiet high
+// bins look loud, so almost anything would pass.
+function makeSDetector(sampleRate, fftSize) {
+  const binHz = sampleRate / fftSize;
+  function bandPower(freqDb, loHz, hiHz) {
+    let lo = Math.max(1, Math.floor(loHz / binHz));
+    let hi = Math.min(freqDb.length - 1, Math.ceil(hiHz / binHz));
+    let s = 0;
+    for (let i = lo; i <= hi; i++) s += Math.pow(10, freqDb[i] / 10); // dB → power
+    return s;
+  }
+  return function detect(freqDb, rms) {
+    if (rms < RMS_FLOOR) return { detected: false, rms, highRatio: 0, sShare: 0 };
+    const lowP = bandPower(freqDb, 120, 900);    // voice / vowels
+    const xLo  = bandPower(freqDb, 900, 1800);   // "Х" core
+    const sh   = bandPower(freqDb, 1800, 4500);  // "Ш" core
+    const sHi  = bandPower(freqDb, 4500, 9500);  // "С" core (high whistle)
+    const fric = xLo + sh + sHi;
+    const total = lowP + fric + 1e-12;
+    const highRatio = fric / total;              // fricative vs vowels
+    const sShare    = sHi / (fric + 1e-12);       // how high the frication sits
+    const detected  = highRatio > FRIC_MIN && sShare > S_SHARE_MIN;
+    return { detected, rms, highRatio, sShare };
+  };
+}
+
+// ─── Static background décor ─────────────────────────────────────────────────
+const CLOUDS = Array.from({ length: 4 }, (_, i) => ({
+  x: 0.1 + Math.random() * 0.8, y: 0.05 + Math.random() * 0.2,
+  scale: 0.6 + Math.random() * 0.7, speed: 0.00006 + Math.random() * 0.00008,
+}));
+// ground tufts at fixed world positions (scroll past as the snake advances)
+const TUFTS = Array.from({ length: 30 }, (_, i) => ({ wx: i * 0.16 + Math.random()*0.05, h: 0.5 + Math.random()*0.6 }));
+
+// ─── Drawing ─────────────────────────────────────────────────────────────────
+function drawScene(ctx, W, H, s) {
+  const { worldOffset, phase, detected, rms, highRatio, sShare, apple, apples,
+          swallows, sparks, praise, praiseAlpha, clouds, showTherapist } = s;
+
+  // sky
+  const sky = ctx.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0, '#9AD9FF'); sky.addColorStop(1, '#E3F6E0');
+  ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+
+  // sun
+  ctx.save();
+  const sunG = ctx.createRadialGradient(W * 0.85, H * 0.13, 0, W * 0.85, H * 0.13, W * 0.16);
+  sunG.addColorStop(0, 'rgba(255,240,150,0.95)'); sunG.addColorStop(1, 'rgba(255,240,150,0)');
+  ctx.fillStyle = sunG; ctx.fillRect(W * 0.6, 0, W * 0.4, H * 0.35);
+  ctx.fillStyle = '#FFE65C';
+  ctx.beginPath(); ctx.arc(W * 0.85, H * 0.13, W * 0.06, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+
+  // clouds
+  clouds.forEach(c => drawCloud(ctx, c.x * W, c.y * H, c.scale, W));
+
+  // ground
+  const groundY = GROUND_Y * H;
+  const gg = ctx.createLinearGradient(0, groundY, 0, H);
+  gg.addColorStop(0, '#86D95C'); gg.addColorStop(1, '#4E9A36');
+  ctx.fillStyle = gg; ctx.fillRect(0, groundY, W, H - groundY);
+  ctx.strokeStyle = 'rgba(255,255,255,0.6)'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(0, groundY); ctx.lineTo(W, groundY); ctx.stroke();
+  // scrolling grass tufts
+  ctx.strokeStyle = '#3f8b34'; ctx.lineCap = 'round';
+  TUFTS.forEach(tf => {
+    let sx = (HEAD_X + (tf.wx - (worldOffset % (TUFTS.length*0.16)))) * W;
+    // wrap into view
+    const span = TUFTS.length * 0.16 * W;
+    sx = ((sx % span) + span) % span;
+    const bh = W * 0.03 * tf.h;
+    ctx.lineWidth = W * 0.006;
+    ctx.beginPath();
+    ctx.moveTo(sx, groundY); ctx.lineTo(sx - bh*0.3, groundY - bh);
+    ctx.moveTo(sx, groundY); ctx.lineTo(sx, groundY - bh*1.2);
+    ctx.moveTo(sx, groundY); ctx.lineTo(sx + bh*0.3, groundY - bh);
+    ctx.stroke();
+  });
+
+  // apple (sitting in front, scrolling toward the head)
+  const appleR = W * 0.045;
+  const appleScreenX = HEAD_X * W + (apple.worldX - worldOffset) * W;
+  if (apple.worldX > worldOffset - 0.02) {
+    drawApple(ctx, appleScreenX, groundY - appleR, appleR);
+  }
+
+  // snake
+  drawSnake(ctx, W, H, phase, swallows, detected);
+
+  // "hiss!" hint when resting
+  if (!detected && swallows.length === 0) {
+    ctx.save(); ctx.textAlign = 'center';
+    ctx.font = `bold ${Math.round(W*0.045)}px "Comic Sans MS", cursive`;
+    ctx.fillStyle = '#2E8B57'; ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.lineWidth = 5;
+    const hx = HEAD_X * W, hy = groundY - W * 0.20;
+    ctx.strokeText('Свисти: с-с-с!', hx, hy); ctx.fillText('Свисти: с-с-с!', hx, hy);
+    ctx.restore();
+  }
+
+  // apple counter (top center)
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.font = `bold ${Math.round(W * 0.05)}px "Comic Sans MS", cursive`;
+  ctx.fillStyle = '#fff'; ctx.strokeStyle = 'rgba(30,90,40,0.7)'; ctx.lineWidth = 5;
+  const txt = `🍎 ${apples} / ${APPLES_TO_WIN}`;
+  ctx.strokeText(txt, W * 0.5, H * 0.09); ctx.fillText(txt, W * 0.5, H * 0.09);
+  ctx.restore();
+
+  // sparks
+  sparks.forEach(p => {
+    ctx.save(); ctx.globalAlpha = p.alpha;
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  });
+
+  // praise
+  if (praise && praiseAlpha > 0) {
+    ctx.save(); ctx.globalAlpha = praiseAlpha; ctx.textAlign = 'center';
+    ctx.font = `bold ${Math.round(W * 0.08)}px "Comic Sans MS", cursive`;
+    ctx.fillStyle = '#E8531C'; ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.lineWidth = 6;
+    ctx.strokeText(praise, W * 0.5, H * 0.32); ctx.fillText(praise, W * 0.5, H * 0.32);
+    ctx.restore();
+  }
+
+  // mic level (bottom-left)
+  const mbW = W * 0.32, mbH = 18, mbX = 16, mbY = H * 0.06;
+  ctx.fillStyle = 'rgba(0,0,0,0.2)'; roundRect(ctx, mbX, mbY, mbW, mbH, 9); ctx.fill();
+  ctx.fillStyle = detected ? '#3FC36A' : '#4D96FF';
+  roundRect(ctx, mbX, mbY, mbW * clamp(rms / 0.25, 0, 1), mbH, 9); ctx.fill();
+  ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.font = `${Math.round(mbH * 0.85)}px sans-serif`;
+  ctx.textAlign = 'left'; ctx.fillText('🎤', mbX + mbW + 6, mbY + mbH - 1);
+
+  // therapist overlay
+  if (showTherapist) {
+    ctx.save(); ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    roundRect(ctx, 10, H*0.06 + 28, 250, 102, 12); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.font = '13px monospace'; ctx.textAlign = 'left';
+    const y0 = H*0.06 + 48;
+    ctx.fillText(`RMS:   ${rms.toFixed(4)}`, 20, y0);
+    ctx.fillText(`Фрикатив: ${highRatio.toFixed(2)} (>${FRIC_MIN})`, 20, y0 + 20);
+    ctx.fillText(`С-фокус: ${sShare.toFixed(2)} (>${S_SHARE_MIN})`, 20, y0 + 40);
+    ctx.fillText(`Звук С: ${detected ? '✓ ТАК' : '✗ ні'}`, 20, y0 + 60);
+    ctx.restore();
+  }
+}
+
+function drawCloud(ctx, cx, cy, scale, W) {
+  const r = W * 0.05 * scale;
+  ctx.save(); ctx.fillStyle = 'rgba(255,255,255,0.92)';
+  [[0,0,r],[-r*0.8,r*0.2,r*0.7],[r*0.8,r*0.2,r*0.7],[-r*0.35,-r*0.45,r*0.6],[r*0.4,-r*0.4,r*0.55]]
+    .forEach(([dx,dy,rad])=>{ ctx.beginPath(); ctx.arc(cx+dx,cy+dy,rad,0,Math.PI*2); ctx.fill(); });
+  ctx.restore();
+}
+
+function drawApple(ctx, cx, cy, r) {
+  ctx.save();
+  // shadow
+  ctx.globalAlpha = 0.16; ctx.fillStyle = '#000';
+  ctx.beginPath(); ctx.ellipse(cx, cy + r*0.95, r*0.85, r*0.2, 0, 0, Math.PI*2); ctx.fill();
+  ctx.globalAlpha = 1;
+  // body
+  const g = ctx.createRadialGradient(cx - r*0.3, cy - r*0.3, r*0.1, cx, cy, r);
+  g.addColorStop(0, '#FF6B5E'); g.addColorStop(1, '#D6273B');
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.moveTo(cx, cy - r*0.6);
+  ctx.bezierCurveTo(cx - r*1.2, cy - r*1.1, cx - r*1.1, cy + r, cx, cy + r);
+  ctx.bezierCurveTo(cx + r*1.1, cy + r, cx + r*1.2, cy - r*1.1, cx, cy - r*0.6);
+  ctx.fill();
+  // highlight
+  ctx.fillStyle = 'rgba(255,255,255,0.35)';
+  ctx.beginPath(); ctx.ellipse(cx - r*0.35, cy - r*0.3, r*0.22, r*0.32, -0.4, 0, Math.PI*2); ctx.fill();
+  // stem
+  ctx.strokeStyle = '#6e4a2a'; ctx.lineWidth = r*0.14; ctx.lineCap='round';
+  ctx.beginPath(); ctx.moveTo(cx, cy - r*0.5); ctx.lineTo(cx + r*0.12, cy - r*0.95); ctx.stroke();
+  // leaf
+  ctx.fillStyle = '#5FبA0'.replace('ب','C') === '#5FCA0' ? '#5FCB4A' : '#5FCB4A';
+  ctx.beginPath(); ctx.ellipse(cx + r*0.4, cy - r*0.9, r*0.3, r*0.16, -0.6, 0, Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+// The snake's head stays at HEAD_X; the body trails to the left in a slither.
+// A swallowed apple shows as a travelling bulge moving head→tail.
+function drawSnake(ctx, W, H, phase, swallows, crawling) {
+  const headX = HEAD_X * W;
+  const baseY = GROUND_Y * H - W * 0.045;
+  const N = 56, bodyLen = 0.52 * W, rMax = W * 0.038;
+  const amp = W * 0.020, waves = 2.6;
+
+  function bodyR(t) {
+    // bulb head, thick body, tapered tail
+    let r = rMax * (1.0 - 0.78 * t);
+    if (t < 0.05) r = rMax * (0.9 + t/0.05*0.12);
+    // swallowed-apple bulges
+    for (const sw of swallows) {
+      r += rMax * 1.35 * Math.exp(-Math.pow((t - sw.p) / 0.07, 2));
+    }
+    return Math.max(rMax * 0.18, r);
+  }
+  function pt(t) {
+    const x = headX - t * bodyLen;
+    const y = baseY + Math.sin(t * waves * Math.PI * 2 - phase) * amp * (0.2 + 0.8 * t);
+    return [x, y];
+  }
+
+  // body — draw tail→head so the head sits on top
+  const bodyGrad = ctx.createLinearGradient(0, baseY - rMax, 0, baseY + rMax);
+  bodyGrad.addColorStop(0, '#7BD957'); bodyGrad.addColorStop(1, '#3E9A3A');
+  ctx.save();
+  ctx.fillStyle = bodyGrad;
+  for (let i = N; i >= 1; i--) {
+    const t = i / N; const [x, y] = pt(t);
+    ctx.beginPath(); ctx.arc(x, y, bodyR(t), 0, Math.PI * 2); ctx.fill();
+  }
+  // belly sheen
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)'; ctx.lineCap = 'round';
+  ctx.lineWidth = rMax * 0.5;
+  ctx.beginPath();
+  for (let i = N; i >= 2; i--) { const t=i/N; const [x,y]=pt(t); if(i===N) ctx.moveTo(x, y - bodyR(t)*0.3); else ctx.lineTo(x, y - bodyR(t)*0.3); }
+  ctx.stroke();
+  ctx.restore();
+
+  // head
+  const [hx, hy] = pt(0);
+  const hr = bodyR(0) * 1.15;
+  ctx.save();
+  const hg = ctx.createLinearGradient(0, hy - hr, 0, hy + hr);
+  hg.addColorStop(0, '#84E060'); hg.addColorStop(1, '#46A340');
+  ctx.fillStyle = hg;
+  ctx.beginPath(); ctx.ellipse(hx, hy, hr * 1.25, hr * 1.0, 0, 0, Math.PI * 2); ctx.fill();
+  // nostrils area / snout highlight
+  ctx.fillStyle = 'rgba(255,255,255,0.18)';
+  ctx.beginPath(); ctx.ellipse(hx + hr*0.4, hy - hr*0.3, hr*0.5, hr*0.3, 0, 0, Math.PI*2); ctx.fill();
+  // eyes
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(hx + hr*0.2, hy - hr*0.5, hr*0.32, 0, Math.PI*2);
+  ctx.arc(hx + hr*0.75, hy - hr*0.5, hr*0.32, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#1b1b1b';
+  ctx.beginPath(); ctx.arc(hx + hr*0.28, hy - hr*0.5, hr*0.16, 0, Math.PI*2);
+  ctx.arc(hx + hr*0.83, hy - hr*0.5, hr*0.16, 0, Math.PI*2); ctx.fill();
+  // forked tongue, flicking out the front (right) while hissing
+  const t2 = Date.now();
+  const flick = crawling ? (0.6 + 0.4*Math.sin(t2/90)) : 0.25 + 0.15*Math.sin(t2/400);
+  const tx = hx + hr*1.25, ty = hy + hr*0.1, tl = hr * (1.4 * flick);
+  ctx.strokeStyle = '#E8455F'; ctx.lineWidth = hr*0.16; ctx.lineCap='round';
+  ctx.beginPath(); ctx.moveTo(tx, ty); ctx.lineTo(tx + tl, ty); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(tx + tl, ty); ctx.lineTo(tx + tl + hr*0.35, ty - hr*0.28);
+  ctx.moveTo(tx + tl, ty); ctx.lineTo(tx + tl + hr*0.35, ty + hr*0.28);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+}
+
+// ─── App ─────────────────────────────────────────────────────────────────────
+function App() {
+  const canvasRef = useRef(null);
+  const audioRef = useRef(null);
+  const rafRef = useRef(null);
+  const timerRef = useRef(null);
+
+  const stateRef = useRef({
+    worldOffset: 0, phase: 0,
+    detected: false, rms: 0, highRatio: 0, sShare: 0,
+    apple: { worldX: FIRST_AHEAD, y: 0 }, apples: 0, wonSignaled: false,
+    swallows: [],
+    sparks: [], praise: null, praiseAlpha: 0,
+    clouds: CLOUDS.map(c => ({ ...c })),
+    lastTime: 0, showTherapist: false,
+  });
+
+  const [phase, setPhase] = useState('start');
+  const [showTherapist, setShowTherapist] = useState(false);
+  useEffect(() => { stateRef.current.showTherapist = showTherapist; }, [showTherapist]);
+
+  const startAudio = useCallback((analyser) => {
+    const freq = new Float32Array(analyser.frequencyBinCount);
+    const time = new Float32Array(analyser.fftSize);
+    const detect = makeSDetector(analyser.context.sampleRate, analyser.fftSize);
+    let confirm = 0;
+    const actx = analyser.context;
+    timerRef.current = setInterval(() => {
+      // iOS Safari parks the context ('suspended'/'interrupted') after a system
+      // sound or a screen dim, which freezes the analyser. Nudge it back.
+      if (actx.state !== 'running' && actx.resume) actx.resume();
+      analyser.getFloatFrequencyData(freq);
+      analyser.getFloatTimeDomainData(time);
+      let sum = 0; for (let i = 0; i < time.length; i++) sum += time[i]*time[i];
+      const rms = Math.sqrt(sum / time.length);
+      const r = detect(freq, rms);
+      if (r.detected) confirm = Math.min(confirm + 1, CONFIRM_FRAMES); else confirm = 0;
+      const s = stateRef.current;
+      s.detected = confirm >= CONFIRM_FRAMES;
+      s.rms = r.rms; s.highRatio = r.highRatio; s.sShare = r.sShare;
+    }, 20);
+  }, []);
+
+  const animate = useCallback((now) => {
+    const canvas = canvasRef.current; if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    const s = stateRef.current;
+    const dt = s.lastTime ? Math.min(now - s.lastTime, 50) : 16;
+    s.lastTime = now;
+    const f = dt / 16;
+
+    s.clouds.forEach(c => { c.x = (c.x + c.speed*dt) % 1.15; if (c.x > 1.1) c.x = -0.15; });
+
+    // Hiss "С" → the snake crawls forward (the world scrolls, the apple nears).
+    if (s.detected) { s.worldOffset += SPEED * f; s.phase += CRAWL * f; }
+
+    // reached the apple?
+    if (s.worldOffset >= s.apple.worldX) {
+      s.apples += 1;
+      s.swallows.push({ p: 0 });
+      s.praise = PRAISE[(s.apples-1) % PRAISE.length]; s.praiseAlpha = 1;
+      const hx = HEAD_X*W, hy = GROUND_Y*H - W*0.05;
+      for (let i=0;i<22;i++) s.sparks.push({
+        x: hx, y: hy, r: 4+Math.random()*8, alpha:1,
+        color: ['#FF5A5A','#FFD93D','#7BD957','#fff'][i%4],
+        vx:(Math.random()-0.5)*7, vy:(Math.random()-0.7)*7, decay:0.02 });
+      if (s.apples >= APPLES_TO_WIN && !s.wonSignaled) { s.wonSignaled = true; setPhase('won'); }
+      else { s.apple = { worldX: s.worldOffset + AHEAD, y: 0 }; }
+    }
+
+    // advance swallowed-apple bulges down the body
+    s.swallows = s.swallows.map(sw => ({ p: sw.p + dt / SWALLOW_MS })).filter(sw => sw.p <= 1.05);
+
+    // particles
+    s.sparks = s.sparks.map(p => ({ ...p, x:p.x+p.vx, y:p.y+p.vy, vy:p.vy+0.15, alpha:p.alpha-p.decay }))
+      .filter(p => p.alpha > 0);
+    if (s.praiseAlpha > 0) s.praiseAlpha = Math.max(0, s.praiseAlpha - 0.01);
+
+    drawScene(ctx, W, H, s);
+
+    window.__telemetry = {
+      game: '🐍 Змійка',
+      primaryLabel: 'Яблука 🍎',
+      primary: s.apples + ' / ' + APPLES_TO_WIN,
+      detect: s.detected,
+      level: s.rms,
+      extra: s.detected ? 'звук С' : '',
+    };
+
+    rafRef.current = requestAnimationFrame(animate);
+  }, []);
+
+  const startGame = useCallback(async () => {
+    try {
+      // All browser voice-DSP OFF: noiseSuppression strips the "С" whistle, and
+      // autoGainControl rides a steady hiss down until detection dies. We boost
+      // the (now faint) phone mic ourselves with a fixed GainNode — a steady
+      // gain that never adapts. It scales rms over RMS_FLOOR but leaves the
+      // band ratios untouched.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { noiseSuppression: false, autoGainControl: false, echoCancellation: false },
+        video: false,
+      });
+      const actx = new (window.AudioContext || window.webkitAudioContext)();
+      if (actx.state === 'suspended') await actx.resume();
+      const src = actx.createMediaStreamSource(stream);
+      const gain = actx.createGain();
+      gain.gain.value = 4;
+      const analyser = actx.createAnalyser();
+      analyser.fftSize = 2048;
+      analyser.smoothingTimeConstant = 0.3;
+      src.connect(gain);
+      gain.connect(analyser);
+      audioRef.current = { actx, stream };
+      startAudio(analyser);
+      setPhase('playing');
+      rafRef.current = requestAnimationFrame(animate);
+    } catch (e) { console.error(e); setPhase('denied'); }
+  }, [animate, startAudio]);
+
+  const restartGame = useCallback(() => {
+    const s = stateRef.current;
+    s.worldOffset = 0; s.phase = 0; s.apples = 0; s.wonSignaled = false;
+    s.apple = { worldX: FIRST_AHEAD, y: 0 }; s.swallows = [];
+    s.sparks = []; s.praise = null; s.praiseAlpha = 0;
+    setPhase('playing');
+  }, []);
+
+  useEffect(() => {
+    const canvas = canvasRef.current; if (!canvas) return;
+    const resize = () => { canvas.width = window.innerWidth; canvas.height = window.innerHeight; };
+    resize(); window.addEventListener('resize', resize);
+    return () => window.removeEventListener('resize', resize);
+  }, []);
+
+  useEffect(() => () => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    if (timerRef.current) clearInterval(timerRef.current);
+    if (audioRef.current) { audioRef.current.stream.getTracks().forEach(t=>t.stop()); audioRef.current.actx.close(); }
+  }, []);
+
+  return (
+    <div style={{ width:'100%', height:'100%', position:'relative' }}>
+      <canvas ref={canvasRef} style={{ position:'absolute', inset:0 }} />
+      <HomeButton />
+      {phase === 'start' && <StartScreen onStart={startGame} />}
+      {phase === 'denied' && <PermissionDenied onRetry={startGame} />}
+      {phase === 'playing' && <TherapistToggle active={showTherapist} onToggle={()=>setShowTherapist(v=>!v)} />}
+      {phase === 'won' && <WinScreen onRestart={restartGame} />}
+    </div>
+  );
+}
+
+// ─── Screens ─────────────────────────────────────────────────────────────────
+function StartScreen({ onStart }) {
+  return (
+    <div style={screenBg('linear-gradient(160deg, #9AD9FF 0%, #B6E8A0 100%)')}>
+      <div style={{ fontSize:'clamp(26px,7vw,58px)', fontWeight:'bold', color:'#1f7a44',
+        textShadow:'2px 3px 0 rgba(255,255,255,0.7)', textAlign:'center', padding:'0 20px' }}>
+        🐍 Змійка
+      </div>
+      <div style={{ fontSize:'clamp(14px,3.6vw,26px)', color:'#236a3a', textAlign:'center',
+        padding:'0 30px', marginTop:'6px', marginBottom:'18px', lineHeight:1.4 }}>
+        Свисти «с-с-с» — і змійка<br />поповзе до яблучка! 🍎
+      </div>
+      <div style={{ fontSize:'clamp(70px,20vw,150px)', marginBottom:'18px',
+        filter:'drop-shadow(0 8px 12px rgba(0,0,0,0.15))' }}>🐍</div>
+      <div style={{ background:'rgba(255,255,255,0.85)', borderRadius:'20px',
+        padding:'clamp(12px,3vw,22px) clamp(16px,5vw,40px)', maxWidth:'520px', width:'90%',
+        marginBottom:'26px', textAlign:'center' }}>
+        <div style={{ fontSize:'clamp(13px,3vw,20px)', color:'#2a6a3a', lineHeight:1.6 }}>
+          🎤 Дозволь доступ до мікрофона<br />
+          🐍 Свисти довге <strong>«с-с-с»</strong><br />
+          🍎 Доповзи до яблучка й з'їж його!
+        </div>
+      </div>
+      <button onClick={onStart} style={btn('#27A05A','#4FD17F')}>🐍 Почати!</button>
+    </div>
+  );
+}
+function PermissionDenied({ onRetry }) {
+  return (
+    <div style={screenBg('linear-gradient(160deg, #ffecd2 0%, #fcb69f 100%)')}>
+      <div style={{ fontSize:'clamp(50px,15vw,120px)', marginBottom:'16px' }}>🎤</div>
+      <div style={{ fontSize:'clamp(20px,5vw,38px)', fontWeight:'bold', color:'#c0392b',
+        marginBottom:'12px', textAlign:'center' }}>Мікрофон недоступний</div>
+      <div style={{ background:'rgba(255,255,255,0.7)', borderRadius:'16px', padding:'16px 24px',
+        maxWidth:'460px', width:'90%', marginBottom:'26px', fontSize:'clamp(13px,3vw,20px)',
+        color:'#555', lineHeight:1.6, textAlign:'center' }}>
+        Дозволь доступ до мікрофона у браузері<br />🔒 (іконка замка в адресному рядку) і спробуй ще.
+      </div>
+      <button onClick={onRetry} style={btn('#2980b9','#3498db')}>🔄 Спробувати знову</button>
+    </div>
+  );
+}
+function WinScreen({ onRestart }) {
+  return (
+    <div style={screenBg('radial-gradient(circle at 50% 35%, rgba(255,255,255,0.85), rgba(120,210,140,0.92))')}>
+      <div style={{ fontSize:'clamp(48px,13vw,120px)', marginBottom:'6px' }}>🎉🐍🍎</div>
+      <div style={{ fontSize:'clamp(26px,7vw,60px)' }}>🍎🍎🍎</div>
+      <div style={{ fontSize:'clamp(26px,7vw,60px)', fontWeight:'bold', color:'#1f7a44',
+        textShadow:'2px 3px 0 rgba(255,255,255,0.8)', textAlign:'center', margin:'8px 0' }}>Молодець! 🌟</div>
+      <div style={{ fontSize:'clamp(16px,4vw,30px)', color:'#236a3a', textAlign:'center',
+        marginBottom:'30px' }}>Змійка наїлася яблучок!</div>
+      <button onClick={onRestart} style={btn('#27A05A','#4FD17F')}>🔄 Ще раз!</button>
+    </div>
+  );
+}
+function HomeButton() {
+  const code = (new URLSearchParams(location.search).get('code') || '').trim();
+  const href = '../' + (code ? '?code=' + encodeURIComponent(code) : '');
+  return (
+    <a href={href} title="До меню" style={{
+      position:'absolute', top:'44px', left:'12px',
+      background:'rgba(0,0,0,0.32)', color:'#fff', textDecoration:'none',
+      borderRadius:'50px', padding:'8px 16px', fontSize:'14px', fontFamily:'inherit',
+      fontWeight:'bold', touchAction:'manipulation', zIndex:10 }}>
+      ← Меню
+    </a>
+  );
+}
+function TherapistToggle({ active, onToggle }) {
+  return (
+    <button onClick={onToggle} title="Режим логопеда" style={{
+      position:'absolute', bottom:'16px', right:'16px',
+      background: active ? 'rgba(30,110,58,0.9)' : 'rgba(0,0,0,0.3)', color:'#fff', border:'none',
+      borderRadius:'50px', padding:'8px 16px', fontSize:'14px', fontFamily:'inherit',
+      cursor:'pointer', touchAction:'manipulation', zIndex:10 }}>
+      {active ? '🩺 Режим логопеда: ВКЛ' : '🩺'}
+    </button>
+  );
+}
+function screenBg(bg) {
+  return { position:'absolute', inset:0, display:'flex', flexDirection:'column',
+    alignItems:'center', justifyContent:'center', background:bg, padding:'20px' };
+}
+function btn(c1, c2) {
+  return { background:`linear-gradient(145deg, ${c1}, ${c2})`, color:'#fff', border:'none',
+    borderRadius:'50px', padding:'clamp(16px,4vw,24px) clamp(40px,10vw,80px)',
+    fontSize:'clamp(20px,5vw,40px)', fontFamily:'inherit', fontWeight:'bold',
+    cursor:'pointer', boxShadow:`0 6px 20px ${c1}88`, touchAction:'manipulation' };
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+<!-- Live monitoring for the therapist (active only when ?code= is present) -->
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="../lib/ice-config.js"></script>
+<script src="../lib/monitor.js"></script>
+</body>
+</html>
