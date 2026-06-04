@@ -23,9 +23,10 @@
 <script type="text/babel">
 const { useState, useEffect, useRef, useCallback } = React;
 
-// ─── Detection tuning for the "Ш" / blow ──────────────────────────────────────
+// ─── Detection tuning for the "Ш" ─────────────────────────────────────────────
 const RMS_FLOOR      = 0.02;   // ignore quiet background
-const HIGH_RATIO_MIN = 0.30;   // "Ш" is a strong high-frequency hiss (no voicing)
+const FRIC_MIN       = 0.45;   // share of energy that must be fricative (vs vowels)
+const SH_SHARE_MIN   = 0.45;   // of the fricative energy, how much sits in the "ш" band
 const CONFIRM_FRAMES = 2;      // consecutive positives before the ball rolls
 
 // Ball physics (horizontal)
@@ -45,13 +46,18 @@ function lerp(a, b, t) { return a + (b - a) * t; }
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
 // ─── "Ш" detector (frequency-domain) ──────────────────────────────────────────
-// "Ш" (and a plain blow) is a sustained UNVOICED FRICATIVE: lots of
-// high-frequency noise with little low-frequency voicing. So unlike "Ж"/"З" we
-// do NOT require voicing — we just need a high frication ratio, which rejects
-// vowels (energy mostly low → small high-ratio) and silence.
+// "Ш", "С" and "Х" are ALL unvoiced fricatives with lots of high-frequency
+// noise, so "is there hiss?" alone can't tell them apart. What separates them is
+// WHERE the frication sits:
+//   • "Х" — diffuse, lower (≈0.9–1.8 kHz)
+//   • "Ш" — mid-high, peaks ≈1.8–4.5 kHz   ← we want this
+//   • "С" — much higher, peaks ≈5–9 kHz
+// So we require two things: enough total frication (rejects vowels/silence), AND
+// that the frication is concentrated in the "ш" band (rejects "Х" below and "С"
+// above). shShare = sh / (xLo + sh + sHi).
 //
-// IMPORTANT: linear power (10^(dB/10)); the raw dB spectrum makes quiet
-// high bins look loud, so almost anything would pass.
+// IMPORTANT: linear power (10^(dB/10)); the raw dB spectrum makes quiet high
+// bins look loud, so almost anything would pass.
 function makeShDetector(sampleRate, fftSize) {
   const binHz = sampleRate / fftSize;
   function bandPower(freqDb, loHz, hiHz) {
@@ -62,16 +68,17 @@ function makeShDetector(sampleRate, fftSize) {
     return s;
   }
   return function detect(freqDb, rms) {
-    if (rms < RMS_FLOOR) return { detected: false, rms, highRatio: 0, voicing: 0 };
-    const lowP  = bandPower(freqDb, 120, 1200);
-    const midP  = bandPower(freqDb, 1200, 2000);
-    const fric  = bandPower(freqDb, 2000, 8000);   // frication / hiss energy (ш)
-    const voic  = bandPower(freqDb, 85, 450);      // voicing (shown only — not required)
-    const total = lowP + midP + fric + 1e-12;
-    const highRatio = fric / total;
-    const voicing   = voic / total;
-    const detected = highRatio > HIGH_RATIO_MIN;
-    return { detected, rms, highRatio, voicing };
+    if (rms < RMS_FLOOR) return { detected: false, rms, highRatio: 0, shShare: 0 };
+    const lowP  = bandPower(freqDb, 120, 900);    // voice / vowels
+    const xLo   = bandPower(freqDb, 900, 1800);   // "Х" core (low frication)
+    const sh    = bandPower(freqDb, 1800, 4500);  // "Ш" core (mid-high frication)
+    const sHi   = bandPower(freqDb, 4500, 9500);  // "С" core (high frication)
+    const fric  = xLo + sh + sHi;
+    const total = lowP + fric + 1e-12;
+    const highRatio = fric / total;               // fricative vs vowels
+    const shShare   = sh / (fric + 1e-12);         // where the frication sits
+    const detected  = highRatio > FRIC_MIN && shShare > SH_SHARE_MIN;
+    return { detected, rms, highRatio, shShare };
   };
 }
 
@@ -83,7 +90,7 @@ const CLOUDS = Array.from({ length: 4 }, (_, i) => ({
 
 // ─── Drawing ─────────────────────────────────────────────────────────────────
 function drawScene(ctx, W, H, s) {
-  const { ballX, vel, rot, detected, rms, highRatio, voicing,
+  const { ballX, vel, rot, detected, rms, highRatio, shShare,
           goals, sparks, praise, praiseAlpha, clouds, showTherapist } = s;
 
   // sky
@@ -187,12 +194,13 @@ function drawScene(ctx, W, H, s) {
   // therapist overlay
   if (showTherapist) {
     ctx.save(); ctx.fillStyle = 'rgba(0,0,0,0.55)';
-    roundRect(ctx, 10, H*0.06 + 28, 230, 82, 12); ctx.fill();
+    roundRect(ctx, 10, H*0.06 + 28, 250, 102, 12); ctx.fill();
     ctx.fillStyle = '#fff'; ctx.font = '13px monospace'; ctx.textAlign = 'left';
     const y0 = H*0.06 + 48;
     ctx.fillText(`RMS:   ${rms.toFixed(4)}`, 20, y0);
-    ctx.fillText(`ВЧ-частка: ${highRatio.toFixed(2)} (>${HIGH_RATIO_MIN})`, 20, y0 + 20);
-    ctx.fillText(`Звук Ш: ${detected ? '✓ ТАК' : '✗ ні'}`, 20, y0 + 40);
+    ctx.fillText(`Фрикатив: ${highRatio.toFixed(2)} (>${FRIC_MIN})`, 20, y0 + 20);
+    ctx.fillText(`Ш-фокус: ${shShare.toFixed(2)} (>${SH_SHARE_MIN})`, 20, y0 + 40);
+    ctx.fillText(`Звук Ш: ${detected ? '✓ ТАК' : '✗ ні'}`, 20, y0 + 60);
     ctx.restore();
   }
 }
@@ -268,7 +276,7 @@ function App() {
 
   const stateRef = useRef({
     ballX: START_X, vel: 0, rot: 0,
-    detected: false, rms: 0, highRatio: 0, voicing: 0,
+    detected: false, rms: 0, highRatio: 0, shShare: 0,
     goals: 0, wonSignaled: false,
     sparks: [], praise: null, praiseAlpha: 0,
     clouds: CLOUDS.map(c => ({ ...c })),
@@ -297,7 +305,7 @@ function App() {
       if (r.detected) confirm = Math.min(confirm + 1, CONFIRM_FRAMES); else confirm = 0;
       const s = stateRef.current;
       s.detected = confirm >= CONFIRM_FRAMES;
-      s.rms = r.rms; s.highRatio = r.highRatio; s.voicing = r.voicing;
+      s.rms = r.rms; s.highRatio = r.highRatio; s.shShare = r.shShare;
     }, 20);
   }, []);
 
