@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>НЛО — склади</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body, #root { width: 100%; height: 100%; overflow: hidden; }
+    body {
+      font-family: 'Comic Sans MS', 'Chalkboard SE', 'Arial Rounded MT Bold', cursive;
+      touch-action: none; user-select: none; -webkit-user-select: none;
+    }
+    canvas { display: block; }
+    #root { position: relative; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ─── Syllable onset detection (amplitude, mic-agnostic) ───────────────────────
+// A syllable is detected as a loudness onset — works for any consonant+vowel and
+// on any phone, because it keys off the envelope, not the fine spectrum.
+const ONSET_MIN_RMS  = 0.026;  // absolute floor for a syllable peak
+const HIGH_FACTOR    = 2.4;    // fire when rms > noiseFloor × this
+const REARM_FRAC     = 0.70;   // re-arm once level dips to this fraction of its own peak
+const RISE_FACTOR    = 1.05;   // only fire on a rising edge
+const PEAK_DECAY     = 0.985;  // recent-peak follower decay per ~20ms frame
+const REFRACTORY_MS  = 130;    // min gap between two counted syllables
+const FLOOR_MIN      = 0.003;
+const FLOOR_MAX      = 0.08;
+
+// ─── Flight / stars ───────────────────────────────────────────────────────────
+const UFO_X      = 0.30;       // saucer's fixed screen column
+const TOP_Y      = 0.12;
+const FLOOR_Y    = 0.80;
+const LIFT_PER   = 0.24;       // how much one syllable lifts the saucer (0..1)
+const LIFT_DECAY = 0.97;       // lift fades each ~16ms frame → saucer sinks when quiet
+const EASE       = 0.16;       // how fast the saucer eases toward its target height
+const SCROLL     = 0.0034;     // world scroll per ~16ms frame
+const STAR_GAP   = 0.32;       // spacing between stars in world units
+const CATCH_X    = 0.09;
+const CATCH_Y    = 0.14;       // generous vertical catch — forgiving for kids
+const STARS_TO_WIN = 10;
+
+const VOWELS = ['А', 'О', 'У', 'Е', 'І'];
+const CONSONANTS = ['Л', 'Р', 'С', 'Ш', 'Ч', 'Ж'];
+const PRAISE = ['Клас! ⭐', 'Супер! 🌟', 'Зірочка! ✨', 'Молодець! 🚀', 'Ще! 💫'];
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+// ─── Onset detector (peak-relative, rising-edge) — same as the dog game ────────
+function makeOnsetDetector() {
+  let noiseFloor = 0.006, lastOnset = -9999, armed = true, peak = 0, prev = 0;
+  return function detect(rms, nowMs) {
+    peak = Math.max(rms, peak * PEAK_DECAY);
+    const high = Math.max(ONSET_MIN_RMS, noiseFloor * HIGH_FACTOR);
+    const rising = rms > prev * RISE_FACTOR;
+    let onset = false;
+    if (rms > high && rising && armed && (nowMs - lastOnset) > REFRACTORY_MS) {
+      onset = true; lastOnset = nowMs; armed = false; peak = rms;
+    }
+    if (!armed && rms < peak * REARM_FRAC) armed = true;
+    if (rms < Math.max(noiseFloor * 1.8, ONSET_MIN_RMS * 0.6)) {
+      noiseFloor = clamp(lerp(noiseFloor, rms, 0.05), FLOOR_MIN, FLOOR_MAX);
+    }
+    prev = rms;
+    return { onset, baseline: noiseFloor };
+  };
+}
+
+// ─── Background stars ─────────────────────────────────────────────────────────
+const BG_STARS = Array.from({ length: 60 }, () => ({
+  x: Math.random(), y: Math.random() * 0.85, r: 0.5 + Math.random() * 1.7, tw: Math.random() * Math.PI * 2,
+}));
+
+// ─── Drawing ─────────────────────────────────────────────────────────────────
+function drawScene(ctx, W, H, s) {
+  const { ufoY, vy, worldOffset, stars, collected, syllable, detected, rms, baseline,
+          onsetFlash, sparks, praise, praiseAlpha, showTherapist } = s;
+  const t = Date.now();
+
+  // night sky
+  const sky = ctx.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0, '#1A1144'); sky.addColorStop(0.6, '#3A2A6E'); sky.addColorStop(1, '#6E5BA0');
+  ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+
+  // background twinkle stars
+  ctx.save(); ctx.fillStyle = '#fff';
+  BG_STARS.forEach(st => {
+    ctx.globalAlpha = 0.35 + Math.sin(t/600 + st.tw) * 0.3;
+    ctx.beginPath(); ctx.arc(st.x * W, st.y * H, st.r, 0, Math.PI*2); ctx.fill();
+  });
+  ctx.restore();
+
+  // moon
+  ctx.save();
+  const mg = ctx.createRadialGradient(W*0.83, H*0.15, 0, W*0.83, H*0.15, W*0.13);
+  mg.addColorStop(0, 'rgba(255,255,235,0.9)'); mg.addColorStop(1, 'rgba(255,255,235,0)');
+  ctx.fillStyle = mg; ctx.fillRect(W*0.62, 0, W*0.38, H*0.34);
+  ctx.fillStyle = '#FFFBE6';
+  ctx.beginPath(); ctx.arc(W*0.83, H*0.15, W*0.05, 0, Math.PI*2); ctx.fill();
+  ctx.restore();
+
+  // ground
+  const groundY = (FLOOR_Y + 0.07) * H;
+  const gg = ctx.createLinearGradient(0, groundY, 0, H);
+  gg.addColorStop(0, '#2C2350'); gg.addColorStop(1, '#191238');
+  ctx.fillStyle = gg; ctx.fillRect(0, groundY, W, H - groundY);
+
+  // collectible stars
+  stars.forEach(st => {
+    if (st.collected) return;
+    const sx = (UFO_X + (st.worldX - worldOffset)) * W;
+    const sy = st.y * H;
+    if (sx < -W*0.1 || sx > W*1.1) return;
+    drawStar(ctx, sx, sy, W * 0.028, t/300 + st.tw);
+  });
+
+  // UFO
+  drawUFO(ctx, UFO_X * W, ufoY * H, W, onsetFlash, vy);
+
+  // sparks
+  sparks.forEach(p => { ctx.save(); ctx.globalAlpha = p.alpha; ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI*2); ctx.fill(); ctx.restore(); });
+
+  // syllable hint (big, top center)
+  ctx.save(); ctx.textAlign = 'center';
+  ctx.font = `bold ${Math.round(W*0.07)}px "Comic Sans MS", cursive`;
+  ctx.fillStyle = '#FFE066'; ctx.strokeStyle = 'rgba(40,20,70,0.8)'; ctx.lineWidth = 6;
+  ctx.strokeText(`Кажи: ${syllable}`, W*0.5, H*0.085); ctx.fillText(`Кажи: ${syllable}`, W*0.5, H*0.085);
+  ctx.restore();
+
+  // star counter
+  ctx.save(); ctx.textAlign = 'center';
+  ctx.font = `bold ${Math.round(W*0.05)}px "Comic Sans MS", cursive`;
+  ctx.fillStyle = '#fff'; ctx.strokeStyle = 'rgba(40,20,70,0.7)'; ctx.lineWidth = 5;
+  const txt = `⭐ ${collected} / ${STARS_TO_WIN}`;
+  ctx.strokeText(txt, W*0.5, H*0.15); ctx.fillText(txt, W*0.5, H*0.15);
+  ctx.restore();
+
+  // praise
+  if (praise && praiseAlpha > 0) {
+    ctx.save(); ctx.globalAlpha = praiseAlpha; ctx.textAlign = 'center';
+    ctx.font = `bold ${Math.round(W*0.075)}px "Comic Sans MS", cursive`;
+    ctx.fillStyle = '#FFD93D'; ctx.strokeStyle = 'rgba(40,20,70,0.8)'; ctx.lineWidth = 5;
+    ctx.strokeText(praise, W*0.5, H*0.42); ctx.fillText(praise, W*0.5, H*0.42);
+    ctx.restore();
+  }
+
+  // mic level
+  const mbW = W*0.32, mbH = 18, mbX = 16, mbY = H*0.055;
+  ctx.fillStyle = 'rgba(0,0,0,0.3)'; roundRect(ctx, mbX, mbY, mbW, mbH, 9); ctx.fill();
+  ctx.fillStyle = onsetFlash > 0.3 ? '#6BCB77' : '#7FA0FF';
+  roundRect(ctx, mbX, mbY, mbW * clamp(rms/0.25, 0, 1), mbH, 9); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,0.8)'; ctx.font = `${Math.round(mbH*0.85)}px sans-serif`;
+  ctx.textAlign = 'left'; ctx.fillText('🎤', mbX + mbW + 6, mbY + mbH - 1);
+
+  // therapist overlay
+  if (showTherapist) {
+    ctx.save(); ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    roundRect(ctx, 10, H*0.055 + 28, 220, 80, 12); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.font = '13px monospace'; ctx.textAlign = 'left';
+    const y0 = H*0.055 + 48;
+    ctx.fillText(`RMS:  ${rms.toFixed(4)}`, 20, y0);
+    ctx.fillText(`Base: ${baseline.toFixed(4)}`, 20, y0 + 20);
+    ctx.fillText(`Зібрано: ${collected}`, 20, y0 + 40);
+    ctx.restore();
+  }
+}
+
+function drawStar(ctx, cx, cy, r, rot) {
+  ctx.save(); ctx.translate(cx, cy); ctx.rotate(Math.sin(rot)*0.15);
+  // glow
+  const g = ctx.createRadialGradient(0,0,0,0,0,r*2.2);
+  g.addColorStop(0,'rgba(255,225,100,0.7)'); g.addColorStop(1,'rgba(255,225,100,0)');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0,0,r*2.2,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#FFD93D'; ctx.strokeStyle = '#FFB300'; ctx.lineWidth = r*0.12;
+  ctx.beginPath();
+  for (let i=0;i<5;i++){
+    const a = -Math.PI/2 + i*2*Math.PI/5;
+    const a2 = a + Math.PI/5;
+    ctx.lineTo(Math.cos(a)*r, Math.sin(a)*r);
+    ctx.lineTo(Math.cos(a2)*r*0.45, Math.sin(a2)*r*0.45);
+  }
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.restore();
+}
+
+function drawUFO(ctx, cx, cy, W, flash, vy) {
+  const s = W * 0.085;
+  const t = Date.now();
+  const bob = Math.sin(t/200) * s * 0.04;
+  ctx.save();
+  ctx.translate(cx, cy + bob);
+  // tilt slightly with vertical motion
+  ctx.rotate(clamp(vy * 8, -0.22, 0.22));
+
+  // tractor beam when rising (just jumped)
+  if (flash > 0.15) {
+    ctx.save(); ctx.globalAlpha = flash * 0.4;
+    const beam = ctx.createLinearGradient(0, 0, 0, s*2.2);
+    beam.addColorStop(0, 'rgba(150,255,200,0.6)'); beam.addColorStop(1, 'rgba(150,255,200,0)');
+    ctx.fillStyle = beam;
+    ctx.beginPath(); ctx.moveTo(-s*0.3, s*0.2); ctx.lineTo(s*0.3, s*0.2);
+    ctx.lineTo(s*0.8, s*2.2); ctx.lineTo(-s*0.8, s*2.2); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  // glow under dome
+  ctx.save(); ctx.globalAlpha = 0.5 + flash*0.4;
+  const gl = ctx.createRadialGradient(0, 0, 0, 0, 0, s*1.4);
+  gl.addColorStop(0, 'rgba(180,230,255,0.6)'); gl.addColorStop(1, 'rgba(180,230,255,0)');
+  ctx.fillStyle = gl; ctx.beginPath(); ctx.arc(0, 0, s*1.4, 0, Math.PI*2); ctx.fill();
+  ctx.restore();
+
+  // saucer body
+  const bg = ctx.createLinearGradient(0, -s*0.2, 0, s*0.4);
+  bg.addColorStop(0, '#D7E3F2'); bg.addColorStop(1, '#8A9BB8');
+  ctx.fillStyle = bg;
+  ctx.beginPath(); ctx.ellipse(0, s*0.12, s*1.0, s*0.32, 0, 0, Math.PI*2); ctx.fill();
+  ctx.strokeStyle = '#6B7C99'; ctx.lineWidth = s*0.04; ctx.stroke();
+
+  // dome
+  const dg = ctx.createLinearGradient(0, -s*0.7, 0, 0);
+  dg.addColorStop(0, '#BEEaFF'.replace('a','E')); dg.addColorStop(1, '#7FC8E8');
+  ctx.fillStyle = '#9FE0F5';
+  ctx.beginPath(); ctx.ellipse(0, 0, s*0.5, s*0.45, 0, Math.PI, 0); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,0.35)';
+  ctx.beginPath(); ctx.ellipse(-s*0.15, -s*0.18, s*0.16, s*0.12, -0.5, 0, Math.PI*2); ctx.fill();
+
+  // bottom lights
+  const lights = 5;
+  for (let i=0;i<lights;i++){
+    const a = -Math.PI*0.8 + (i/(lights-1))*Math.PI*0.6;
+    const lx = Math.cos(a)*s*0.7, ly = s*0.12 + Math.abs(Math.sin(a))*s*0.1;
+    const on = (Math.floor(t/200) + i) % 2 === 0 || flash > 0.3;
+    ctx.fillStyle = on ? '#FFE066' : '#C9A23B';
+    ctx.beginPath(); ctx.arc(lx, ly + s*0.16, s*0.09, 0, Math.PI*2); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+}
+
+// ─── App ─────────────────────────────────────────────────────────────────────
+function App() {
+  const canvasRef = useRef(null);
+  const audioRef = useRef(null);
+  const rafRef = useRef(null);
+  const timerRef = useRef(null);
+
+  const stateRef = useRef({
+    ufoY: 0.6, vy: 0, lift: 0,
+    worldOffset: 0, nextWorldX: 0.6,
+    stars: [], collected: 0, wonSignaled: false,
+    syllable: 'ЛА',
+    detected: false, rms: 0, baseline: 0, onsetFlash: 0, onsetPending: 0,
+    sparks: [], praise: null, praiseAlpha: 0,
+    lastTime: 0, showTherapist: false,
+  });
+
+  const [phase, setPhase] = useState('start');
+  const [showTherapist, setShowTherapist] = useState(false);
+  useEffect(() => { stateRef.current.showTherapist = showTherapist; }, [showTherapist]);
+
+  const startAudio = useCallback((analyser) => {
+    const buf = new Float32Array(analyser.fftSize);
+    const detector = makeOnsetDetector();
+    const actx = analyser.context;
+    timerRef.current = setInterval(() => {
+      if (actx.state !== 'running' && actx.resume) actx.resume();
+      analyser.getFloatTimeDomainData(buf);
+      let sum = 0; for (let i = 0; i < buf.length; i++) sum += buf[i]*buf[i];
+      const rms = Math.sqrt(sum / buf.length);
+      const { onset, baseline } = detector(rms, performance.now());
+      const s = stateRef.current;
+      s.rms = rms; s.baseline = baseline;
+      if (onset) s.onsetPending += 1;
+    }, 20);
+  }, []);
+
+  const animate = useCallback((now) => {
+    const canvas = canvasRef.current; if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    const s = stateRef.current;
+    const dt = s.lastTime ? Math.min(now - s.lastTime, 50) : 16;
+    s.lastTime = now;
+    const f = dt / 16;
+
+    // each heard syllable adds lift (a bounce up); lift fades when quiet so the
+    // saucer sinks. Height follows recent syllable rate — fast → high, stop → down.
+    while (s.onsetPending > 0) {
+      s.onsetPending -= 1;
+      s.lift = clamp(s.lift + LIFT_PER, 0, 1);
+      s.onsetFlash = 1;
+    }
+    s.lift = clamp(s.lift * Math.pow(LIFT_DECAY, f), 0, 1);
+    const targetY = FLOOR_Y - s.lift * (FLOOR_Y - TOP_Y);
+    const prevY = s.ufoY;
+    s.ufoY = lerp(s.ufoY, targetY, clamp(EASE * f, 0, 1));
+    s.vy = s.ufoY - prevY;   // per-frame delta, used only for the saucer's tilt
+
+    // scroll the world and keep stars ahead while the game is on
+    s.worldOffset += SCROLL * f;
+    if (s.collected < STARS_TO_WIN) {
+      while (s.nextWorldX - s.worldOffset < 0.72) {
+        s.stars.push({ worldX: s.nextWorldX, y: 0.30 + Math.random() * 0.34,
+          collected: false, tw: Math.random() * Math.PI * 2 });
+        s.nextWorldX += STAR_GAP;
+      }
+    }
+
+    // collect / cull
+    for (const st of s.stars) {
+      if (st.collected) continue;
+      const sx = UFO_X + (st.worldX - s.worldOffset);
+      if (Math.abs(sx - UFO_X) < CATCH_X && Math.abs(st.y - s.ufoY) < CATCH_Y) {
+        st.collected = true;
+        s.collected += 1;
+        s.praise = PRAISE[(s.collected - 1) % PRAISE.length]; s.praiseAlpha = 1;
+        for (let i=0;i<16;i++) s.sparks.push({
+          x: UFO_X*W, y: st.y*H, r: 3+Math.random()*6, alpha: 1,
+          color: ['#FFD93D','#FFF1A6','#9FE0F5','#fff'][i%4],
+          vx: (Math.random()-0.5)*6, vy: (Math.random()-0.5)*6, decay: 0.02 });
+        if (s.collected >= STARS_TO_WIN && !s.wonSignaled) { s.wonSignaled = true; setPhase('won'); }
+      }
+    }
+    // drop collected stars and ones that scrolled off the left edge
+    s.stars = s.stars.filter(st => !st.collected && (st.worldX - s.worldOffset) > -0.2);
+
+    s.onsetFlash = lerp(s.onsetFlash, 0, 0.08 * f);
+    s.sparks = s.sparks.map(p => ({ ...p, x:p.x+p.vx, y:p.y+p.vy, vy:p.vy+0.12, alpha:p.alpha-p.decay }))
+      .filter(p => p.alpha > 0);
+    if (s.praiseAlpha > 0) s.praiseAlpha = Math.max(0, s.praiseAlpha - 0.012);
+
+    drawScene(ctx, W, H, s);
+
+    window.__telemetry = {
+      game: '🛸 НЛО — склади',
+      primaryLabel: 'Зірочки ⭐',
+      primary: s.collected + ' / ' + STARS_TO_WIN,
+      detect: s.onsetFlash > 0.3,
+      level: s.rms,
+      extra: 'склад ' + s.syllable,
+    };
+
+    rafRef.current = requestAnimationFrame(animate);
+  }, []);
+
+  const startGame = useCallback(async (syllable) => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { noiseSuppression: false, autoGainControl: true, echoCancellation: false },
+        video: false,
+      });
+      const actx = new (window.AudioContext || window.webkitAudioContext)();
+      if (actx.state === 'suspended') await actx.resume();
+      const src = actx.createMediaStreamSource(stream);
+      const analyser = actx.createAnalyser();
+      analyser.fftSize = 1024;
+      analyser.smoothingTimeConstant = 0;
+      src.connect(analyser);
+      audioRef.current = { actx, stream };
+      // reset round
+      const s = stateRef.current;
+      s.ufoY = 0.6; s.vy = 0; s.lift = 0; s.worldOffset = 0; s.nextWorldX = 0.6;
+      s.stars = []; s.collected = 0; s.wonSignaled = false; s.onsetPending = 0;
+      s.sparks = []; s.praise = null; s.praiseAlpha = 0; s.syllable = syllable;
+      startAudio(analyser);
+      setPhase('playing');
+      rafRef.current = requestAnimationFrame(animate);
+    } catch (e) { console.error(e); setPhase('denied'); }
+  }, [animate, startAudio]);
+
+  const restartGame = useCallback(() => {
+    const s = stateRef.current;
+    s.ufoY = 0.6; s.vy = 0; s.worldOffset = 0; s.nextWorldX = 0.6;
+    s.stars = []; s.collected = 0; s.wonSignaled = false; s.onsetPending = 0;
+    s.sparks = []; s.praise = null; s.praiseAlpha = 0;
+    setPhase('playing');
+  }, []);
+
+  useEffect(() => {
+    const canvas = canvasRef.current; if (!canvas) return;
+    const resize = () => { canvas.width = window.innerWidth; canvas.height = window.innerHeight; };
+    resize(); window.addEventListener('resize', resize);
+    return () => window.removeEventListener('resize', resize);
+  }, []);
+
+  useEffect(() => () => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    if (timerRef.current) clearInterval(timerRef.current);
+    if (audioRef.current) { audioRef.current.stream.getTracks().forEach(t=>t.stop()); audioRef.current.actx.close(); }
+  }, []);
+
+  return (
+    <div style={{ width:'100%', height:'100%', position:'relative' }}>
+      <canvas ref={canvasRef} style={{ position:'absolute', inset:0 }} />
+      <HomeButton />
+      {phase === 'start' && <StartScreen onStart={startGame} />}
+      {phase === 'denied' && <PermissionDenied onRetry={() => startGame(stateRef.current.syllable)} />}
+      {phase === 'playing' && <TherapistToggle active={showTherapist} onToggle={()=>setShowTherapist(v=>!v)} />}
+      {phase === 'won' && <WinScreen onRestart={restartGame} syllable={stateRef.current.syllable} />}
+    </div>
+  );
+}
+
+// ─── Screens ─────────────────────────────────────────────────────────────────
+function StartScreen({ onStart }) {
+  const [cons, setCons] = useState('Л');
+  const [vow, setVow] = useState('А');
+  const syllable = cons + vow.toLowerCase();
+  const chip = (label, active, onClick) => (
+    <button key={label} onClick={onClick} style={{
+      minWidth: '46px', padding: '10px 14px', margin: '4px', fontFamily: 'inherit',
+      fontSize: 'clamp(18px,4.5vw,26px)', fontWeight: 'bold', borderRadius: '14px',
+      border: active ? '3px solid #FFD93D' : '3px solid rgba(255,255,255,0.3)',
+      background: active ? 'rgba(255,217,61,0.25)' : 'rgba(255,255,255,0.12)',
+      color: '#fff', cursor: 'pointer', touchAction: 'manipulation',
+    }}>{label}</button>
+  );
+  return (
+    <div style={screenBg('linear-gradient(160deg, #1A1144 0%, #6E5BA0 100%)')}>
+      <div style={{ fontSize:'clamp(24px,6.5vw,56px)', fontWeight:'bold', color:'#fff',
+        textShadow:'2px 3px 0 rgba(20,10,50,0.6)', textAlign:'center', padding:'0 20px' }}>
+        🛸 Тарілка й склади
+      </div>
+      <div style={{ fontSize:'clamp(13px,3.4vw,22px)', color:'#E7DBFF', textAlign:'center',
+        padding:'0 28px', marginTop:'4px', marginBottom:'14px' }}>
+        Обери склад і кажи його — тарілка<br/>підстрибує й збирає зірочки! ⭐
+      </div>
+      <div style={{ fontSize:'clamp(56px,16vw,110px)', margin:'2px 0',
+        filter:'drop-shadow(0 6px 12px rgba(0,0,0,0.3))' }}>🛸</div>
+
+      <div style={{ background:'rgba(255,255,255,0.1)', borderRadius:'18px', padding:'12px',
+        maxWidth:'560px', width:'94%', textAlign:'center', marginBottom:'10px' }}>
+        <div style={{ color:'#FFD93D', fontSize:'clamp(13px,3vw,18px)', marginBottom:'2px' }}>Приголосна</div>
+        <div style={{ display:'flex', flexWrap:'wrap', justifyContent:'center' }}>
+          {CONSONANTS.map(c => chip(c, c === cons, () => setCons(c)))}
+        </div>
+        <div style={{ color:'#FFD93D', fontSize:'clamp(13px,3vw,18px)', margin:'6px 0 2px' }}>Голосна</div>
+        <div style={{ display:'flex', flexWrap:'wrap', justifyContent:'center' }}>
+          {VOWELS.map(v => chip(v, v === vow, () => setVow(v)))}
+        </div>
+      </div>
+
+      <div style={{ fontSize:'clamp(28px,8vw,54px)', fontWeight:'bold', color:'#FFE066',
+        textShadow:'2px 2px 0 rgba(20,10,50,0.6)', margin:'4px 0 14px' }}>{syllable}</div>
+
+      <button onClick={() => onStart(syllable)} style={btn('#5B6BD6','#7E8FF0')}>🚀 Почати!</button>
+    </div>
+  );
+}
+function PermissionDenied({ onRetry }) {
+  return (
+    <div style={screenBg('linear-gradient(160deg, #ffecd2 0%, #fcb69f 100%)')}>
+      <div style={{ fontSize:'clamp(50px,15vw,120px)', marginBottom:'16px' }}>🎤</div>
+      <div style={{ fontSize:'clamp(20px,5vw,38px)', fontWeight:'bold', color:'#c0392b',
+        marginBottom:'12px', textAlign:'center' }}>Мікрофон недоступний</div>
+      <div style={{ background:'rgba(255,255,255,0.7)', borderRadius:'16px', padding:'16px 24px',
+        maxWidth:'460px', width:'90%', marginBottom:'26px', fontSize:'clamp(13px,3vw,20px)',
+        color:'#555', lineHeight:1.6, textAlign:'center' }}>
+        Дозволь доступ до мікрофона у браузері<br />🔒 (іконка замка в адресному рядку) і спробуй ще.
+      </div>
+      <button onClick={onRetry} style={btn('#2980b9','#3498db')}>🔄 Спробувати знову</button>
+    </div>
+  );
+}
+function WinScreen({ onRestart, syllable }) {
+  return (
+    <div style={screenBg('radial-gradient(circle at 50% 35%, rgba(255,255,255,0.85), rgba(110,91,160,0.95))')}>
+      <div style={{ fontSize:'clamp(48px,13vw,120px)', marginBottom:'6px' }}>🎉🛸⭐</div>
+      <div style={{ fontSize:'clamp(26px,7vw,60px)' }}>⭐⭐⭐</div>
+      <div style={{ fontSize:'clamp(26px,7vw,60px)', fontWeight:'bold', color:'#5B3AA0',
+        textShadow:'2px 3px 0 rgba(255,255,255,0.8)', textAlign:'center', margin:'8px 0' }}>Молодець! 🌟</div>
+      <div style={{ fontSize:'clamp(16px,4vw,30px)', color:'#3a2a6e', textAlign:'center',
+        marginBottom:'30px' }}>Тарілка зібрала всі зірочки!<br/>Склад «{syllable}» вдався! ✨</div>
+      <button onClick={onRestart} style={btn('#5B6BD6','#7E8FF0')}>🔄 Ще раз!</button>
+    </div>
+  );
+}
+function HomeButton() {
+  const code = (new URLSearchParams(location.search).get('code') || '').trim();
+  const href = '../' + (code ? '?code=' + encodeURIComponent(code) : '');
+  return (
+    <a href={href} title="До меню" style={{
+      position:'absolute', top:'44px', left:'12px',
+      background:'rgba(0,0,0,0.32)', color:'#fff', textDecoration:'none',
+      borderRadius:'50px', padding:'8px 16px', fontSize:'14px', fontFamily:'inherit',
+      fontWeight:'bold', touchAction:'manipulation', zIndex:10 }}>
+      ← Меню
+    </a>
+  );
+}
+function TherapistToggle({ active, onToggle }) {
+  return (
+    <button onClick={onToggle} title="Режим логопеда" style={{
+      position:'absolute', bottom:'16px', right:'16px',
+      background: active ? 'rgba(91,58,160,0.9)' : 'rgba(0,0,0,0.3)', color:'#fff', border:'none',
+      borderRadius:'50px', padding:'8px 16px', fontSize:'14px', fontFamily:'inherit',
+      cursor:'pointer', touchAction:'manipulation', zIndex:10 }}>
+      {active ? '🩺 Режим логопеда: ВКЛ' : '🩺'}
+    </button>
+  );
+}
+function screenBg(bg) {
+  return { position:'absolute', inset:0, display:'flex', flexDirection:'column',
+    alignItems:'center', justifyContent:'center', background:bg, padding:'16px' };
+}
+function btn(c1, c2) {
+  return { background:`linear-gradient(145deg, ${c1}, ${c2})`, color:'#fff', border:'none',
+    borderRadius:'50px', padding:'clamp(14px,3.5vw,22px) clamp(36px,9vw,72px)',
+    fontSize:'clamp(20px,5vw,38px)', fontFamily:'inherit', fontWeight:'bold',
+    cursor:'pointer', boxShadow:`0 6px 20px ${c1}88`, touchAction:'manipulation' };
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+<!-- Live monitoring for the therapist (active only when ?code= is present) -->
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="../lib/ice-config.js"></script>
+<script src="../lib/monitor.js"></script>
+</body>
+</html>
