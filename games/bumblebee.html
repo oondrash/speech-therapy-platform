@@ -26,8 +26,8 @@ const { useState, useEffect, useRef, useCallback } = React;
 // ─── Detection tuning for the "Ж" buzz ───────────────────────────────────────
 const RMS_FLOOR       = 0.02;   // ignore quiet background
 const HIGH_RATIO_MIN  = 0.12;   // fraction of (linear) energy in the fricative band (vs vowels)
-const SH_SHARE_MIN    = 0.40;   // of the frication, how much is mid (ж) vs high (з)
-const VOICING_MIN     = 0.05;   // some low-freq voicing → ж (voiced), not ш
+const SH_SHARE_MIN    = 0.30;   // of the frication, how much is mid (ж) vs high (з)
+const VOICING_MIN     = 0.03;   // some low-freq voicing → ж (voiced), not ш
 const CONFIRM_FRAMES  = 3;      // consecutive positives before lift
 
 // Movement
