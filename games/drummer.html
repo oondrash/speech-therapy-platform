@@ -618,6 +618,7 @@ function App() {
   return (
     <div style={{ width: '100%', height: '100%', position: 'relative' }}>
       <canvas ref={canvasRef} style={{ position: 'absolute', inset: 0 }} />
+      <HomeButton />
       {phase === 'start' && <StartScreen onStart={startGame} />}
       {phase === 'denied' && <PermissionDenied onRetry={startGame} />}
       {phase === 'playing' && (
@@ -693,6 +694,19 @@ function PermissionDenied({ onRetry }) {
   );
 }
 
+function HomeButton() {
+  const code = (new URLSearchParams(location.search).get('code') || '').trim();
+  const href = '../' + (code ? '?code=' + encodeURIComponent(code) : '');
+  return (
+    <a href={href} title="До меню" style={{
+      position: 'absolute', top: '44px', left: '12px',
+      background: 'rgba(0,0,0,0.32)', color: '#fff', textDecoration: 'none',
+      borderRadius: '50px', padding: '8px 16px', fontSize: '14px', fontFamily: 'inherit',
+      fontWeight: 'bold', touchAction: 'manipulation', zIndex: 10 }}>
+      ← Меню
+    </a>
+  );
+}
 function TherapistToggle({ active, onToggle }) {
   return (
     <button onClick={onToggle} title="Режим логопеда" style={{

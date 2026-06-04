@@ -412,6 +412,7 @@ function App() {
   return (
     <div style={{ width:'100%', height:'100%', position:'relative' }}>
       <canvas ref={canvasRef} style={{ position:'absolute', inset:0 }} />
+      <HomeButton />
       {phase === 'start' && <StartScreen onStart={startGame} />}
       {phase === 'denied' && <PermissionDenied onRetry={startGame} />}
       {phase === 'playing' && <TherapistToggle active={showTherapist} onToggle={()=>setShowTherapist(v=>!v)} />}
@@ -473,6 +474,19 @@ function WinScreen({ onRestart }) {
         marginBottom:'30px' }}>Усі м'ячі — у воротах!</div>
       <button onClick={onRestart} style={btn('#27A05A','#4FD17F')}>🔄 Ще раз!</button>
     </div>
+  );
+}
+function HomeButton() {
+  const code = (new URLSearchParams(location.search).get('code') || '').trim();
+  const href = '../' + (code ? '?code=' + encodeURIComponent(code) : '');
+  return (
+    <a href={href} title="До меню" style={{
+      position:'absolute', top:'44px', left:'12px',
+      background:'rgba(0,0,0,0.32)', color:'#fff', textDecoration:'none',
+      borderRadius:'50px', padding:'8px 16px', fontSize:'14px', fontFamily:'inherit',
+      fontWeight:'bold', touchAction:'manipulation', zIndex:10 }}>
+      ← Меню
+    </a>
   );
 }
 function TherapistToggle({ active, onToggle }) {
