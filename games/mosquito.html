@@ -1,0 +1,668 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Комарик — вчимо звук З</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body, #root { width: 100%; height: 100%; overflow: hidden; }
+    body {
+      font-family: 'Comic Sans MS', 'Chalkboard SE', 'Arial Rounded MT Bold', cursive;
+      touch-action: none; user-select: none; -webkit-user-select: none;
+    }
+    canvas { display: block; }
+    #root { position: relative; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ─── Detection tuning for the "З" buzz ────────────────────────────────────────
+const RMS_FLOOR       = 0.02;   // ignore quiet background
+const HIGH_RATIO_MIN  = 0.12;   // fraction of (linear) energy in the fricative band
+const VOICING_MIN     = 0.06;   // some low-freq voicing → з (voiced), not с
+const CONFIRM_FRAMES  = 3;      // consecutive positives before lift
+
+// Movement
+const RISE_SPEED  = 0.024;
+const FALL_SPEED  = 0.006;
+const LERP_FACTOR = 0.09;
+const TOP_BOUND    = 0.10;
+const BOTTOM_BOUND = 0.84;
+
+// Nose / bites
+const BITES_TO_WIN = 3;
+const REACH_RADIUS = 0.085;     // how close the mosquito must get to the nose
+const FILL_MS      = 5000;      // hold the buzz this long at the nose to bite
+const DRAIN_MS     = 4000;      // the bar drains this slowly when truly silent
+const GRACE_MS     = 650;       // tolerate short buzz dropouts without letting go
+
+const PRAISE = ['Ам! 🦟', 'Смачно! 😋', 'Прищик! 🔴', 'Молодець! 🌟', 'Ще укус! 😄'];
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+// ─── "З" detector (frequency-domain) ──────────────────────────────────────────
+// "З" is a sustained VOICED SIBILANT: lots of HIGH-frequency frication (higher
+// than "Ж") plus low-frequency voicing. We require both, which separates it from
+// vowels (energy mostly low → small high-ratio) and from the unvoiced "С" (no
+// voicing). The frication band sits high (3–9 kHz) because "З" is a sharp,
+// high-pitched hiss.
+//
+// IMPORTANT: we work in LINEAR POWER (10^(dB/10)). Using the raw dB spectrum
+// makes quiet high-frequency bins look loud, so almost any sound would pass.
+function makeZDetector(sampleRate, fftSize) {
+  const binHz = sampleRate / fftSize;
+  function bandPower(freqDb, loHz, hiHz) {
+    let lo = Math.max(1, Math.floor(loHz / binHz));
+    let hi = Math.min(freqDb.length - 1, Math.ceil(hiHz / binHz));
+    let s = 0;
+    for (let i = lo; i <= hi; i++) s += Math.pow(10, freqDb[i] / 10); // dB → power
+    return s;
+  }
+  return function detect(freqDb, rms) {
+    if (rms < RMS_FLOOR) return { detected: false, rms, highRatio: 0, voicing: 0 };
+    const lowP  = bandPower(freqDb, 120, 1200);
+    const midP  = bandPower(freqDb, 1200, 3000);
+    const fric  = bandPower(freqDb, 3000, 9000);   // sibilant frication (з/с) — high
+    const voic  = bandPower(freqDb, 85, 450);      // voicing energy (з, not с) — low pitches too
+    const total = lowP + midP + fric + 1e-12;
+    const highRatio = fric / total;
+    const voicing   = voic / total;
+    const detected = highRatio > HIGH_RATIO_MIN && voicing > VOICING_MIN;
+    return { detected, rms, highRatio, voicing };
+  };
+}
+
+// ─── Static background décor ─────────────────────────────────────────────────
+const CLOUDS = Array.from({ length: 4 }, (_, i) => ({
+  x: 0.1 + Math.random() * 0.8, y: 0.06 + Math.random() * 0.18,
+  scale: 0.6 + Math.random() * 0.7, speed: 0.00006 + Math.random() * 0.00008,
+}));
+const STARS = Array.from({ length: 26 }, () => ({
+  x: Math.random(), y: Math.random() * 0.6, r: 0.6 + Math.random() * 1.6,
+  tw: Math.random() * Math.PI * 2,
+}));
+
+// ─── Drawing ─────────────────────────────────────────────────────────────────
+function drawScene(ctx, W, H, s) {
+  const { beeY, detected, rms, highRatio, voicing, nose, fill, atFlower,
+          bites, pimples, sparks, praise, praiseAlpha, clouds, showTherapist } = s;
+
+  // dusk sky (mosquitoes come out in the evening)
+  const sky = ctx.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0, '#3B3A6B'); sky.addColorStop(0.55, '#6E6AA8'); sky.addColorStop(1, '#C9A9D6');
+  ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+
+  // stars
+  const t = Date.now();
+  ctx.save(); ctx.fillStyle = '#fff';
+  STARS.forEach(st => {
+    ctx.globalAlpha = 0.4 + Math.sin(t/600 + st.tw) * 0.35;
+    ctx.beginPath(); ctx.arc(st.x * W, st.y * H, st.r, 0, Math.PI * 2); ctx.fill();
+  });
+  ctx.restore();
+
+  // moon
+  ctx.save();
+  const moonG = ctx.createRadialGradient(W * 0.82, H * 0.14, 0, W * 0.82, H * 0.14, W * 0.14);
+  moonG.addColorStop(0, 'rgba(255,255,235,0.95)'); moonG.addColorStop(1, 'rgba(255,255,235,0)');
+  ctx.fillStyle = moonG; ctx.fillRect(W * 0.6, 0, W * 0.4, H * 0.32);
+  ctx.fillStyle = '#FFFBE6';
+  ctx.beginPath(); ctx.arc(W * 0.82, H * 0.14, W * 0.055, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+
+  // clouds (dim at dusk)
+  ctx.save(); ctx.globalAlpha = 0.6;
+  clouds.forEach(c => drawCloud(ctx, c.x * W, c.y * H, c.scale, W));
+  ctx.restore();
+
+  // ground
+  const grassH = H * 0.14;
+  const gg = ctx.createLinearGradient(0, H - grassH, 0, H);
+  gg.addColorStop(0, '#3E7A3A'); gg.addColorStop(1, '#27521F');
+  ctx.fillStyle = gg; ctx.fillRect(0, H - grassH, W, grassH);
+
+  // altitude bar (right)
+  const barH = H * 0.66, barY = H * 0.16, barX = W - 20;
+  ctx.fillStyle = 'rgba(0,0,0,0.18)';
+  roundRect(ctx, barX - 6, barY, 14, barH, 7); ctx.fill();
+  ctx.fillStyle = detected ? 'rgba(120,220,120,0.95)' : 'rgba(200,200,210,0.55)';
+  const fillH = barH * (1 - beeY);
+  roundRect(ctx, barX - 6, barY + barH - fillH, 14, fillH, 7); ctx.fill();
+
+  // the target face/nose (up high)
+  const fx = nose.x * W, fy = nose.y * H;
+  drawFace(ctx, fx, fy, W * 0.13, atFlower, pimples);
+
+  // bite-fill ring around the nose (fills while the child holds the buzz)
+  if (fill > 0) {
+    const rr = W * 0.17;
+    ctx.save();
+    ctx.translate(fx, fy);
+    ctx.lineWidth = W * 0.022; ctx.lineCap = 'round';
+    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+    ctx.beginPath(); ctx.arc(0, 0, rr, 0, Math.PI * 2); ctx.stroke();
+    ctx.strokeStyle = atFlower ? '#FF5A5A' : '#FF9C4D';
+    ctx.beginPath(); ctx.arc(0, 0, rr, -Math.PI/2, -Math.PI/2 + Math.PI*2*clamp(fill,0,1)); ctx.stroke();
+    ctx.restore();
+  }
+  // "hold the buzz!" hint while biting
+  if (atFlower) {
+    ctx.save(); ctx.textAlign = 'center';
+    ctx.font = `bold ${Math.round(W*0.04)}px "Comic Sans MS", cursive`;
+    ctx.fillStyle = '#FFE07A'; ctx.strokeStyle = 'rgba(60,40,80,0.85)'; ctx.lineWidth = 4;
+    ctx.strokeText('Тримай Зз-зз!', fx, fy - W*0.22);
+    ctx.fillText('Тримай Зз-зз!', fx, fy - W*0.22);
+    ctx.restore();
+  }
+
+  // mosquito
+  const bx = W * 0.42;
+  const by = beeY * H;
+  drawMosquito(ctx, bx, by, detected || atFlower, W, s.anim);
+
+  // bite counter (top center)
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.font = `bold ${Math.round(W * 0.05)}px "Comic Sans MS", cursive`;
+  ctx.fillStyle = '#fff'; ctx.strokeStyle = 'rgba(60,30,70,0.7)'; ctx.lineWidth = 5;
+  const txt = `🦟 ${bites} / ${BITES_TO_WIN}`;
+  ctx.strokeText(txt, W * 0.5, H * 0.085); ctx.fillText(txt, W * 0.5, H * 0.085);
+  ctx.restore();
+  for (let i = 0; i < BITES_TO_WIN; i++) {
+    const px = W * 0.5 + (i - (BITES_TO_WIN - 1) / 2) * W * 0.058;
+    drawPip(ctx, px, H * 0.125, W * 0.013, i < bites);
+  }
+
+  // sparks
+  sparks.forEach(p => {
+    ctx.save(); ctx.globalAlpha = p.alpha;
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  });
+
+  // praise
+  if (praise && praiseAlpha > 0) {
+    ctx.save(); ctx.globalAlpha = praiseAlpha; ctx.textAlign = 'center';
+    ctx.font = `bold ${Math.round(W * 0.07)}px "Comic Sans MS", cursive`;
+    ctx.fillStyle = '#FFD93D'; ctx.strokeStyle = 'rgba(60,40,80,0.85)'; ctx.lineWidth = 5;
+    ctx.strokeText(praise, W * 0.5, H * 0.32); ctx.fillText(praise, W * 0.5, H * 0.32);
+    ctx.restore();
+  }
+
+  // mic level + buzz hint (bottom-left)
+  const mbW = W * 0.32, mbH = 18, mbX = 16, mbY = H - grassH - mbH - 12;
+  ctx.fillStyle = 'rgba(0,0,0,0.25)'; roundRect(ctx, mbX, mbY, mbW, mbH, 9); ctx.fill();
+  ctx.fillStyle = detected ? '#8BE36B' : '#9BB0FF';
+  roundRect(ctx, mbX, mbY, mbW * clamp(rms / 0.25, 0, 1), mbH, 9); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,0.8)'; ctx.font = `${Math.round(mbH * 0.85)}px sans-serif`;
+  ctx.textAlign = 'left'; ctx.fillText('🎤', mbX + mbW + 6, mbY + mbH - 1);
+
+  // therapist overlay
+  if (showTherapist) {
+    ctx.save(); ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    roundRect(ctx, 10, 10, 230, 100, 12); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.font = '13px monospace'; ctx.textAlign = 'left';
+    ctx.fillText(`RMS:   ${rms.toFixed(4)}`, 20, 32);
+    ctx.fillText(`ВЧ-частка: ${highRatio.toFixed(2)} (>${HIGH_RATIO_MIN})`, 20, 52);
+    ctx.fillText(`Голос: ${voicing.toFixed(2)} (>${VOICING_MIN})`, 20, 72);
+    ctx.fillText(`Звук З: ${detected ? '✓ ТАК' : '✗ ні'}`, 20, 92);
+    ctx.restore();
+  }
+}
+
+function drawCloud(ctx, cx, cy, scale, W) {
+  const r = W * 0.05 * scale;
+  ctx.save(); ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  [[0,0,r],[-r*0.8,r*0.2,r*0.7],[r*0.8,r*0.2,r*0.7],[-r*0.35,-r*0.45,r*0.6],[r*0.4,-r*0.4,r*0.55]]
+    .forEach(([dx,dy,rad])=>{ ctx.beginPath(); ctx.arc(cx+dx,cy+dy,rad,0,Math.PI*2); ctx.fill(); });
+  ctx.restore();
+}
+
+function drawPip(ctx, cx, cy, r, filled) {
+  ctx.save();
+  ctx.fillStyle = filled ? '#FF5A5A' : 'rgba(255,255,255,0.45)';
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2); ctx.fill();
+  if (filled) {
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.beginPath(); ctx.arc(cx - r*0.3, cy - r*0.3, r*0.32, 0, Math.PI*2); ctx.fill();
+  }
+  ctx.restore();
+}
+
+// A friendly round face with a big nose — the mosquito's target. Pimples (bite
+// marks) accumulate on it and ride along when the face moves to a new spot.
+function drawFace(ctx, cx, cy, r, active, pimples) {
+  const t = Date.now();
+  ctx.save(); ctx.translate(cx, cy);
+
+  // soft glow so it reads as the target
+  ctx.save(); ctx.globalAlpha = 0.25 + Math.sin(t/250)*0.1;
+  const g = ctx.createRadialGradient(0,0,0,0,0,r*1.9);
+  g.addColorStop(0,'rgba(255,235,200,0.9)'); g.addColorStop(1,'rgba(255,235,200,0)');
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(0,0,r*1.9,0,Math.PI*2); ctx.fill(); ctx.restore();
+
+  // head (skin)
+  const skin = ctx.createLinearGradient(0,-r,0,r);
+  skin.addColorStop(0,'#FFE0BD'); skin.addColorStop(1,'#F6C89A');
+  ctx.fillStyle = skin;
+  ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI*2); ctx.fill();
+  // ears
+  ctx.beginPath(); ctx.arc(-r, 0, r*0.22, 0, Math.PI*2); ctx.arc(r, 0, r*0.22, 0, Math.PI*2); ctx.fill();
+
+  // hair tuft
+  ctx.fillStyle = '#8a5a3a';
+  ctx.beginPath();
+  ctx.moveTo(-r*0.6, -r*0.78);
+  ctx.quadraticCurveTo(0, -r*1.25, r*0.6, -r*0.78);
+  ctx.quadraticCurveTo(r*0.2, -r*0.95, 0, -r*0.9);
+  ctx.quadraticCurveTo(-r*0.2, -r*0.95, -r*0.6, -r*0.78);
+  ctx.fill();
+
+  // eyes
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.ellipse(-r*0.38,-r*0.12,r*0.18,r*0.22,0,0,Math.PI*2);
+  ctx.ellipse(r*0.38,-r*0.12,r*0.18,r*0.22,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#3a2c1a';
+  const look = Math.sin(t/700)*r*0.04;
+  ctx.beginPath(); ctx.arc(-r*0.36+look,-r*0.1,r*0.08,0,Math.PI*2);
+  ctx.arc(r*0.4+look,-r*0.1,r*0.08,0,Math.PI*2); ctx.fill();
+
+  // nose (the bite target — prominent, centered)
+  const noseG = ctx.createLinearGradient(0,r*0.05,0,r*0.5);
+  noseG.addColorStop(0,'#FFD2A6'); noseG.addColorStop(1,'#F0B07E');
+  ctx.fillStyle = noseG;
+  ctx.beginPath(); ctx.ellipse(0, r*0.22, r*0.2, r*0.26, 0, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = 'rgba(200,120,80,0.35)';
+  ctx.beginPath(); ctx.arc(-r*0.07, r*0.32, r*0.04, 0, Math.PI*2);
+  ctx.arc(r*0.07, r*0.32, r*0.04, 0, Math.PI*2); ctx.fill();
+
+  // mouth (a little "ой!" when being bitten)
+  ctx.strokeStyle = '#9a5a4a'; ctx.lineWidth = r*0.05; ctx.lineCap='round';
+  ctx.beginPath();
+  if (active) ctx.arc(0, r*0.5, r*0.13, 0, Math.PI*2);          // surprised o
+  else ctx.arc(0, r*0.46, r*0.22, 0.15*Math.PI, 0.85*Math.PI);  // smile
+  ctx.stroke();
+
+  // pimples (bite marks) left behind
+  (pimples || []).forEach(p => {
+    const x = p.dx * r, y = p.dy * r, pr = r * p.s;
+    ctx.fillStyle = 'rgba(220,90,70,0.35)';
+    ctx.beginPath(); ctx.arc(x, y, pr*1.7, 0, Math.PI*2); ctx.fill();   // red halo
+    ctx.fillStyle = '#E8533F';
+    ctx.beginPath(); ctx.arc(x, y, pr, 0, Math.PI*2); ctx.fill();        // bump
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.beginPath(); ctx.arc(x - pr*0.3, y - pr*0.3, pr*0.35, 0, Math.PI*2); ctx.fill();
+  });
+
+  ctx.restore();
+}
+
+function drawMosquito(ctx, cx, cy, active, W, anim) {
+  const s = W * 0.072;
+  const t = Date.now();
+  const bob = Math.sin(t/150) * s * 0.07;
+  ctx.save();
+  ctx.translate(cx, cy + bob);
+
+  // shadow
+  ctx.save(); ctx.globalAlpha = 0.12; ctx.fillStyle='#000';
+  ctx.beginPath(); ctx.ellipse(0, s*1.0, s*0.6, s*0.13, 0, 0, Math.PI*2); ctx.fill(); ctx.restore();
+
+  // legs (six thin bent legs)
+  ctx.strokeStyle = '#4a4a55'; ctx.lineWidth = s*0.04; ctx.lineCap='round';
+  const legSwing = Math.sin(t/200)*s*0.08;
+  [[-1,0.1],[-1,0.45],[-1,0.78],[1,0.1],[1,0.45],[1,0.78]].forEach(([side,yy])=>{
+    ctx.beginPath();
+    ctx.moveTo(side*s*0.18, yy*s);
+    ctx.quadraticCurveTo(side*s*0.7, yy*s + s*0.1, side*s*0.95, yy*s + s*0.55 + legSwing);
+    ctx.stroke();
+  });
+
+  // wings (long translucent, flap fast when buzzing)
+  const flap = Math.sin(t / (active ? 16 : 50));
+  ctx.save();
+  ctx.globalAlpha = 0.55;
+  ctx.fillStyle = 'rgba(225,235,255,0.85)';
+  ctx.strokeStyle = 'rgba(150,175,210,0.7)'; ctx.lineWidth = s*0.025;
+  [[-1],[1]].forEach(([side])=>{
+    ctx.save();
+    ctx.translate(side*s*0.18, -s*0.25);
+    ctx.rotate(side * (0.7 + flap*0.4));
+    ctx.beginPath(); ctx.ellipse(side*s*0.75, 0, s*0.8, s*0.26, 0, 0, Math.PI*2);
+    ctx.fill(); ctx.stroke();
+    ctx.restore();
+  });
+  ctx.restore();
+
+  // body — slender abdomen, tilted
+  ctx.save();
+  ctx.rotate(Math.sin(t/300)*0.05 - 0.15);
+  const bg = ctx.createLinearGradient(0,-s*0.4,0,s*0.9);
+  bg.addColorStop(0,'#8A8475'); bg.addColorStop(1,'#5C564A');
+  ctx.fillStyle = bg;
+  ctx.beginPath(); ctx.ellipse(0, s*0.35, s*0.26, s*0.7, 0, 0, Math.PI*2); ctx.fill();
+  // faint abdomen bands
+  ctx.save();
+  ctx.beginPath(); ctx.ellipse(0, s*0.35, s*0.26, s*0.7, 0, 0, Math.PI*2); ctx.clip();
+  ctx.strokeStyle = 'rgba(40,36,30,0.5)'; ctx.lineWidth = s*0.06;
+  [0.1,0.45,0.8].forEach(yy=>{ ctx.beginPath(); ctx.moveTo(-s*0.4, yy*s); ctx.lineTo(s*0.4, yy*s); ctx.stroke(); });
+  ctx.restore();
+  ctx.restore();
+
+  // head
+  ctx.fillStyle = '#4a4438';
+  ctx.beginPath(); ctx.arc(0, -s*0.42, s*0.26, 0, Math.PI*2); ctx.fill();
+  // antennae (feathery)
+  ctx.strokeStyle = '#4a4438'; ctx.lineWidth = s*0.04; ctx.lineCap='round';
+  [[-1],[1]].forEach(([side])=>{
+    ctx.beginPath(); ctx.moveTo(side*s*0.08, -s*0.6);
+    ctx.quadraticCurveTo(side*s*0.3, -s*0.95, side*s*0.22, -s*1.12); ctx.stroke();
+  });
+  // eyes
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(-s*0.1,-s*0.45,s*0.09,0,Math.PI*2); ctx.arc(s*0.1,-s*0.45,s*0.09,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#15110a';
+  ctx.beginPath(); ctx.arc(-s*0.09,-s*0.44,s*0.05,0,Math.PI*2); ctx.arc(s*0.11,-s*0.44,s*0.05,0,Math.PI*2); ctx.fill();
+
+  // proboscis (long needle pointing UP toward the nose) — extends when drinking
+  const reach = anim ? anim.drink : 0;
+  ctx.strokeStyle = '#2e2a22'; ctx.lineWidth = s*0.05; ctx.lineCap='round';
+  ctx.beginPath(); ctx.moveTo(0, -s*0.62); ctx.lineTo(0, -s*0.62 - (s*0.5 + reach*s*1.0)); ctx.stroke();
+
+  ctx.restore();
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+}
+
+// ─── App ─────────────────────────────────────────────────────────────────────
+function App() {
+  const canvasRef = useRef(null);
+  const audioRef = useRef(null);
+  const rafRef = useRef(null);
+  const timerRef = useRef(null);
+
+  const newNose = () => ({
+    x: 0.42 + (Math.random() - 0.5) * 0.06,
+    y: 0.15 + Math.random() * 0.16,
+  });
+  // The opening nose sits low so the very first reach is short and easy;
+  // later noses (newNose) climb higher for a gradual ramp.
+  const firstNose = () => ({ x: 0.42, y: 0.46 });
+  // a fresh bite mark, placed near the nose / cheeks (offsets in head-radius units)
+  const newPimple = () => ({
+    dx: (Math.random() - 0.5) * 1.2,
+    dy: 0.0 + Math.random() * 0.7,
+    s: 0.07 + Math.random() * 0.04,
+  });
+
+  const stateRef = useRef({
+    beeY: 0.8, targetBeeY: 0.8,
+    detected: false, rms: 0, highRatio: 0, voicing: 0,
+    nose: firstNose(),
+    fill: 0, atFlower: false, grace: 0, bites: 0, pimples: [], wonSignaled: false,
+    sparks: [], praise: null, praiseAlpha: 0,
+    anim: { drink: 0 },
+    clouds: CLOUDS.map(c => ({ ...c })),
+    lastTime: 0, showTherapist: false,
+  });
+
+  const [phase, setPhase] = useState('start');
+  const [showTherapist, setShowTherapist] = useState(false);
+  useEffect(() => { stateRef.current.showTherapist = showTherapist; }, [showTherapist]);
+
+  const startAudio = useCallback((analyser) => {
+    const freq = new Float32Array(analyser.frequencyBinCount);
+    const time = new Float32Array(analyser.fftSize);
+    const detect = makeZDetector(analyser.context.sampleRate, analyser.fftSize);
+    let confirm = 0;
+    const actx = analyser.context;
+    timerRef.current = setInterval(() => {
+      // iOS Safari parks the context ('suspended'/'interrupted') after a system
+      // sound or a screen dim, which freezes the analyser. Nudge it back.
+      if (actx.state !== 'running' && actx.resume) actx.resume();
+      analyser.getFloatFrequencyData(freq);
+      analyser.getFloatTimeDomainData(time);
+      let sum = 0; for (let i = 0; i < time.length; i++) sum += time[i]*time[i];
+      const rms = Math.sqrt(sum / time.length);
+      const r = detect(freq, rms);
+      if (r.detected) confirm = Math.min(confirm + 1, CONFIRM_FRAMES); else confirm = 0;
+      const s = stateRef.current;
+      s.detected = confirm >= CONFIRM_FRAMES;
+      s.rms = r.rms; s.highRatio = r.highRatio; s.voicing = r.voicing;
+    }, 20);
+  }, []);
+
+  const animate = useCallback((now) => {
+    const canvas = canvasRef.current; if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    const s = stateRef.current;
+    const dt = s.lastTime ? Math.min(now - s.lastTime, 50) : 16;
+    s.lastTime = now;
+
+    s.clouds.forEach(c => { c.x = (c.x + c.speed*dt) % 1.15; if (c.x > 1.1) c.x = -0.15; });
+
+    // Are we at the nose? Engage when the mosquito arrives while buzzing;
+    // silence (past the grace window) releases it and the mosquito falls.
+    const bx = 0.42, aspect = W / H;
+    const dx = s.nose.x - bx, dy = (s.nose.y - s.beeY) / aspect;
+    const near = (dx*dx + dy*dy) < REACH_RADIUS*REACH_RADIUS;
+    if (!s.atFlower && near && s.detected) { s.atFlower = true; s.grace = GRACE_MS; }
+
+    if (s.atFlower) {
+      // Hover locked at the nose. Brief buzz dropouts (lower pitch, a quick
+      // breath) are tolerated for GRACE_MS so it doesn't slip off the nose.
+      s.targetBeeY = s.nose.y;
+      if (s.detected) {
+        s.grace = GRACE_MS;
+        s.anim.drink = lerp(s.anim.drink, 1, 0.2);
+        s.fill += dt / FILL_MS;
+        if (Math.random() < 0.3) {
+          s.sparks.push({ x: s.nose.x*W + (Math.random()-0.5)*W*0.05, y: s.nose.y*H,
+            r: 3 + Math.random()*5, alpha: 1, color: '#FF6B6B',
+            vx: (Math.random()-0.5)*1, vy: -1 - Math.random()*1.5, decay: 0.02 });
+        }
+        if (s.fill >= 1) {
+          s.bites += 1;
+          s.pimples.push(newPimple());
+          s.praise = PRAISE[(s.bites-1) % PRAISE.length]; s.praiseAlpha = 1;
+          for (let i=0;i<22;i++) s.sparks.push({
+            x: s.nose.x*W, y: s.nose.y*H, r: 4+Math.random()*8, alpha:1,
+            color: ['#FF5A5A','#FFD93D','#fff'][i%3],
+            vx:(Math.random()-0.5)*6, vy:(Math.random()-0.5)*6, decay:0.02 });
+          s.fill = 0; s.atFlower = false; s.anim.drink = 0;
+          if (s.bites >= BITES_TO_WIN && !s.wonSignaled) { s.wonSignaled = true; setPhase('won'); }
+          else s.nose = newNose();
+        }
+      } else {
+        // Dropout: hold position, pause the bar (no drain), burn grace. Let go at 0.
+        s.grace -= dt;
+        if (s.grace <= 0) s.atFlower = false;
+      }
+    } else {
+      // physics: rise on "З", gravity otherwise; the bar drains while not filling
+      if (s.detected) s.targetBeeY = Math.max(TOP_BOUND, s.targetBeeY - RISE_SPEED*(dt/16));
+      else s.targetBeeY = Math.min(BOTTOM_BOUND, s.targetBeeY + FALL_SPEED*(dt/16));
+      s.anim.drink = lerp(s.anim.drink, 0, 0.2);
+      s.fill = Math.max(0, s.fill - dt / DRAIN_MS);
+    }
+    s.beeY = lerp(s.beeY, s.targetBeeY, LERP_FACTOR);
+
+    // particles
+    s.sparks = s.sparks.map(p => ({ ...p, x:p.x+p.vx, y:p.y+p.vy, alpha:p.alpha-p.decay }))
+      .filter(p => p.alpha > 0);
+    if (s.praiseAlpha > 0) s.praiseAlpha = Math.max(0, s.praiseAlpha - 0.01);
+
+    drawScene(ctx, W, H, s);
+
+    window.__telemetry = {
+      game: '🦟 Комар',
+      primaryLabel: 'Укуси 🦟',
+      primary: s.bites + ' / ' + BITES_TO_WIN,
+      detect: s.detected,
+      level: s.rms,
+      extra: s.detected ? 'звук З' : '',
+    };
+
+    rafRef.current = requestAnimationFrame(animate);
+  }, []);
+
+  const startGame = useCallback(async () => {
+    try {
+      // All browser voice-DSP OFF: noiseSuppression strips the "З" frication,
+      // and autoGainControl rides a steady buzz down until detection dies (a
+      // pulsed "З-З-З" survives, a held "Зззз" doesn't). We instead boost the
+      // (now faint) phone mic ourselves with a fixed GainNode below — a steady
+      // gain that never adapts. The gain scales rms over RMS_FLOOR but leaves
+      // highRatio/voicing untouched, since those are energy *ratios*.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { noiseSuppression: false, autoGainControl: false, echoCancellation: false },
+        video: false,
+      });
+      const actx = new (window.AudioContext || window.webkitAudioContext)();
+      if (actx.state === 'suspended') await actx.resume();
+      const src = actx.createMediaStreamSource(stream);
+      const gain = actx.createGain();
+      gain.gain.value = 4;            // recover the level AGC used to provide
+      const analyser = actx.createAnalyser();
+      analyser.fftSize = 2048;
+      analyser.smoothingTimeConstant = 0.3;
+      src.connect(gain);
+      gain.connect(analyser);
+      audioRef.current = { actx, stream };
+      startAudio(analyser);
+      setPhase('playing');
+      rafRef.current = requestAnimationFrame(animate);
+    } catch (e) { console.error(e); setPhase('denied'); }
+  }, [animate, startAudio]);
+
+  const restartGame = useCallback(() => {
+    const s = stateRef.current;
+    s.beeY = 0.8; s.targetBeeY = 0.8; s.bites = 0; s.pimples = []; s.wonSignaled = false;
+    s.fill = 0; s.atFlower = false; s.grace = 0; s.sparks = []; s.praise = null; s.praiseAlpha = 0;
+    s.nose = firstNose(); s.anim.drink = 0;
+    setPhase('playing');
+  }, []);
+
+  useEffect(() => {
+    const canvas = canvasRef.current; if (!canvas) return;
+    const resize = () => { canvas.width = window.innerWidth; canvas.height = window.innerHeight; };
+    resize(); window.addEventListener('resize', resize);
+    return () => window.removeEventListener('resize', resize);
+  }, []);
+
+  useEffect(() => () => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    if (timerRef.current) clearInterval(timerRef.current);
+    if (audioRef.current) { audioRef.current.stream.getTracks().forEach(t=>t.stop()); audioRef.current.actx.close(); }
+  }, []);
+
+  return (
+    <div style={{ width:'100%', height:'100%', position:'relative' }}>
+      <canvas ref={canvasRef} style={{ position:'absolute', inset:0 }} />
+      {phase === 'start' && <StartScreen onStart={startGame} />}
+      {phase === 'denied' && <PermissionDenied onRetry={startGame} />}
+      {phase === 'playing' && <TherapistToggle active={showTherapist} onToggle={()=>setShowTherapist(v=>!v)} />}
+      {phase === 'won' && <WinScreen onRestart={restartGame} />}
+    </div>
+  );
+}
+
+// ─── Screens ─────────────────────────────────────────────────────────────────
+function StartScreen({ onStart }) {
+  return (
+    <div style={screenBg('linear-gradient(160deg, #3B3A6B 0%, #C9A9D6 100%)')}>
+      <div style={{ fontSize:'clamp(26px,7vw,58px)', fontWeight:'bold', color:'#fff',
+        textShadow:'2px 3px 0 rgba(60,40,90,0.6)', textAlign:'center', padding:'0 20px' }}>
+        🦟 Комарик
+      </div>
+      <div style={{ fontSize:'clamp(14px,3.6vw,26px)', color:'#FCEFFF', textAlign:'center',
+        padding:'0 30px', marginTop:'6px', marginBottom:'18px', lineHeight:1.4 }}>
+        Дзижчи «Зз-зз» — і комарик<br />полетить до носика! 👃
+      </div>
+      <div style={{ fontSize:'clamp(70px,20vw,150px)', marginBottom:'18px',
+        filter:'drop-shadow(0 8px 12px rgba(0,0,0,0.25))' }}>🦟</div>
+      <div style={{ background:'rgba(255,255,255,0.85)', borderRadius:'20px',
+        padding:'clamp(12px,3vw,22px) clamp(16px,5vw,40px)', maxWidth:'520px', width:'90%',
+        marginBottom:'26px', textAlign:'center' }}>
+        <div style={{ fontSize:'clamp(13px,3vw,20px)', color:'#5a3a7a', lineHeight:1.6 }}>
+          🎤 Дозволь доступ до мікрофона<br />
+          🦟 Дзижчи довге <strong>«Зз-зз-зз»</strong><br />
+          👃 Долети до носика й вкуси його!
+        </div>
+      </div>
+      <button onClick={onStart} style={btn('#7E5AC8','#A77BE0')}>🦟 Почати!</button>
+    </div>
+  );
+}
+function PermissionDenied({ onRetry }) {
+  return (
+    <div style={screenBg('linear-gradient(160deg, #ffecd2 0%, #fcb69f 100%)')}>
+      <div style={{ fontSize:'clamp(50px,15vw,120px)', marginBottom:'16px' }}>🎤</div>
+      <div style={{ fontSize:'clamp(20px,5vw,38px)', fontWeight:'bold', color:'#c0392b',
+        marginBottom:'12px', textAlign:'center' }}>Мікрофон недоступний</div>
+      <div style={{ background:'rgba(255,255,255,0.7)', borderRadius:'16px', padding:'16px 24px',
+        maxWidth:'460px', width:'90%', marginBottom:'26px', fontSize:'clamp(13px,3vw,20px)',
+        color:'#555', lineHeight:1.6, textAlign:'center' }}>
+        Дозволь доступ до мікрофона у браузері<br />🔒 (іконка замка в адресному рядку) і спробуй ще.
+      </div>
+      <button onClick={onRetry} style={btn('#2980b9','#3498db')}>🔄 Спробувати знову</button>
+    </div>
+  );
+}
+function WinScreen({ onRestart }) {
+  return (
+    <div style={screenBg('radial-gradient(circle at 50% 35%, rgba(255,255,255,0.85), rgba(167,123,224,0.92))')}>
+      <div style={{ fontSize:'clamp(48px,13vw,120px)', marginBottom:'6px' }}>🎉🦟🌙</div>
+      <div style={{ fontSize:'clamp(26px,7vw,60px)' }}>🔴🔴🔴</div>
+      <div style={{ fontSize:'clamp(26px,7vw,60px)', fontWeight:'bold', color:'#7E5AC8',
+        textShadow:'2px 3px 0 rgba(255,255,255,0.8)', textAlign:'center', margin:'8px 0' }}>Молодець! 🌟</div>
+      <div style={{ fontSize:'clamp(16px,4vw,30px)', color:'#5a3a7a', textAlign:'center',
+        marginBottom:'30px' }}>Комарик наївся досхочу!</div>
+      <button onClick={onRestart} style={btn('#7E5AC8','#A77BE0')}>🔄 Ще раз!</button>
+    </div>
+  );
+}
+function TherapistToggle({ active, onToggle }) {
+  return (
+    <button onClick={onToggle} title="Режим логопеда" style={{
+      position:'absolute', bottom:'16px', right:'16px',
+      background: active ? 'rgba(90,60,120,0.9)' : 'rgba(0,0,0,0.3)', color:'#fff', border:'none',
+      borderRadius:'50px', padding:'8px 16px', fontSize:'14px', fontFamily:'inherit',
+      cursor:'pointer', touchAction:'manipulation', zIndex:10 }}>
+      {active ? '🩺 Режим логопеда: ВКЛ' : '🩺'}
+    </button>
+  );
+}
+function screenBg(bg) {
+  return { position:'absolute', inset:0, display:'flex', flexDirection:'column',
+    alignItems:'center', justifyContent:'center', background:bg, padding:'20px' };
+}
+function btn(c1, c2) {
+  return { background:`linear-gradient(145deg, ${c1}, ${c2})`, color:'#fff', border:'none',
+    borderRadius:'50px', padding:'clamp(16px,4vw,24px) clamp(40px,10vw,80px)',
+    fontSize:'clamp(20px,5vw,40px)', fontFamily:'inherit', fontWeight:'bold',
+    cursor:'pointer', boxShadow:`0 6px 20px ${c1}88`, touchAction:'manipulation' };
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+<!-- Live monitoring for the therapist (active only when ?code= is present) -->
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="../lib/ice-config.js"></script>
+<script src="../lib/monitor.js"></script>
+</body>
+</html>
