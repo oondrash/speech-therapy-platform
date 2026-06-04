@@ -24,9 +24,11 @@
 const { useState, useEffect, useRef, useCallback } = React;
 
 // ─── Onset detection tuning ──────────────────────────────────────────────────
-const ONSET_MIN_RMS  = 0.045;  // absolute loudness floor for a "ла"
-const HIGH_FACTOR    = 3.0;    // fire when rms > noiseFloor × this
-const LOW_FACTOR     = 1.8;    // re-arm when rms drops below noiseFloor × this
+const ONSET_MIN_RMS  = 0.026;  // absolute floor for a syllable peak (soft "ла" too)
+const HIGH_FACTOR    = 2.4;    // fire when rms > noiseFloor × this
+const REARM_FRAC     = 0.70;   // re-arm once level dips to this fraction of its own peak
+const RISE_FACTOR    = 1.05;   // only fire on a rising edge (rms climbing)
+const PEAK_DECAY     = 0.985;  // recent-peak follower decay per ~20ms frame
 const REFRACTORY_MS  = 130;    // min gap between two counted beats
 const FLOOR_MIN      = 0.003;
 const FLOOR_MAX      = 0.08;
@@ -37,30 +39,40 @@ const PRAISE = ['Гав! 🎵', 'Браво! 👏', 'Танцюй! 💃', 'Су�
 function lerp(a, b, t) { return a + (b - a) * t; }
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
-// ─── Onset detector (Schmitt trigger) ────────────────────────────────────────
-// A beat fires on the rising edge above a HIGH threshold; the trigger must fall
-// back below a LOW threshold before it can fire again (hysteresis). The noise
-// floor adapts only while quiet, so loud "ла" bursts never inflate it.
+// ─── Onset detector (peak-relative, rising-edge) ──────────────────────────────
+// A syllable fires on a RISING edge once rms climbs above a HIGH threshold. To
+// fire again it must first dip — but "ла" is a sonorant, so connected "ла-ла"
+// never drops to silence between syllables; it only dips a little. So instead of
+// re-arming against the noise floor (which a sonorant dip never reaches), we
+// re-arm once rms falls below a fraction of its OWN recent peak. The rising-edge
+// gate stops a re-arm during the fall from immediately re-triggering. The noise
+// floor adapts only while genuinely quiet, so loud bursts never inflate it.
 function makeOnsetDetector() {
   let noiseFloor = 0.006;
   let lastOnset = -9999;
   let armed = true;
+  let peak = 0;
+  let prev = 0;
 
   return function detect(rms, nowMs) {
+    peak = Math.max(rms, peak * PEAK_DECAY);
     const high = Math.max(ONSET_MIN_RMS, noiseFloor * HIGH_FACTOR);
-    const low  = Math.max(noiseFloor * LOW_FACTOR, high * 0.5);
+    const rising = rms > prev * RISE_FACTOR;
 
     let onset = false;
-    if (rms > high && armed && (nowMs - lastOnset) > REFRACTORY_MS) {
+    if (rms > high && rising && armed && (nowMs - lastOnset) > REFRACTORY_MS) {
       onset = true;
       lastOnset = nowMs;
       armed = false;
+      peak = rms;                       // track this syllable's loudness
     }
-    if (rms < low) {
-      armed = true;
-      // track the quiet background only (slow follower)
+    // re-arm on a dip relative to the recent peak (handles shallow sonorant dips)
+    if (!armed && rms < peak * REARM_FRAC) armed = true;
+    // adapt the quiet background only (slow follower)
+    if (rms < Math.max(noiseFloor * 1.8, ONSET_MIN_RMS * 0.6)) {
       noiseFloor = clamp(lerp(noiseFloor, rms, 0.05), FLOOR_MIN, FLOOR_MAX);
     }
+    prev = rms;
     return { onset, baseline: noiseFloor };
   };
 }
