@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Футбол — вчимо звук Ш</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body, #root { width: 100%; height: 100%; overflow: hidden; }
+    body {
+      font-family: 'Comic Sans MS', 'Chalkboard SE', 'Arial Rounded MT Bold', cursive;
+      touch-action: none; user-select: none; -webkit-user-select: none;
+    }
+    canvas { display: block; }
+    #root { position: relative; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ─── Detection tuning for the "Ш" / blow ──────────────────────────────────────
+const RMS_FLOOR      = 0.02;   // ignore quiet background
+const HIGH_RATIO_MIN = 0.30;   // "Ш" is a strong high-frequency hiss (no voicing)
+const CONFIRM_FRAMES = 2;      // consecutive positives before the ball rolls
+
+// Ball physics (horizontal)
+const START_X   = 0.13;        // ball starts near the left
+const GOAL_X    = 0.85;        // centre of the ball reaches the goal here
+const GROUND_Y  = 0.80;        // rolling line
+const ACCEL     = 0.00050;     // push per 16ms while blowing
+const FRICTION  = 0.90;        // velocity decay per 16ms when not pushed enough
+const MAX_VEL   = 0.010;       // cap so a long blow can't rocket across
+const ROT_K     = 26;          // how fast the ball spins relative to speed
+
+const GOALS_TO_WIN = 3;
+
+const PRAISE = ['Гол! ⚽', 'Супер! 🌟', 'У ворота! 🥅', 'Молодець! 🎉', 'Ще гол! ⚽'];
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+// ─── "Ш" detector (frequency-domain) ──────────────────────────────────────────
+// "Ш" (and a plain blow) is a sustained UNVOICED FRICATIVE: lots of
+// high-frequency noise with little low-frequency voicing. So unlike "Ж"/"З" we
+// do NOT require voicing — we just need a high frication ratio, which rejects
+// vowels (energy mostly low → small high-ratio) and silence.
+//
+// IMPORTANT: linear power (10^(dB/10)); the raw dB spectrum makes quiet
+// high bins look loud, so almost anything would pass.
+function makeShDetector(sampleRate, fftSize) {
+  const binHz = sampleRate / fftSize;
+  function bandPower(freqDb, loHz, hiHz) {
+    let lo = Math.max(1, Math.floor(loHz / binHz));
+    let hi = Math.min(freqDb.length - 1, Math.ceil(hiHz / binHz));
+    let s = 0;
+    for (let i = lo; i <= hi; i++) s += Math.pow(10, freqDb[i] / 10); // dB → power
+    return s;
+  }
+  return function detect(freqDb, rms) {
+    if (rms < RMS_FLOOR) return { detected: false, rms, highRatio: 0, voicing: 0 };
+    const lowP  = bandPower(freqDb, 120, 1200);
+    const midP  = bandPower(freqDb, 1200, 2000);
+    const fric  = bandPower(freqDb, 2000, 8000);   // frication / hiss energy (ш)
+    const voic  = bandPower(freqDb, 85, 450);      // voicing (shown only — not required)
+    const total = lowP + midP + fric + 1e-12;
+    const highRatio = fric / total;
+    const voicing   = voic / total;
+    const detected = highRatio > HIGH_RATIO_MIN;
+    return { detected, rms, highRatio, voicing };
+  };
+}
+
+// ─── Static background décor ─────────────────────────────────────────────────
+const CLOUDS = Array.from({ length: 4 }, (_, i) => ({
+  x: 0.1 + Math.random() * 0.8, y: 0.05 + Math.random() * 0.2,
+  scale: 0.6 + Math.random() * 0.7, speed: 0.00006 + Math.random() * 0.00008,
+}));
+
+// ─── Drawing ─────────────────────────────────────────────────────────────────
+function drawScene(ctx, W, H, s) {
+  const { ballX, vel, rot, detected, rms, highRatio, voicing,
+          goals, sparks, praise, praiseAlpha, clouds, showTherapist } = s;
+
+  // sky
+  const sky = ctx.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0, '#7EC8FF'); sky.addColorStop(1, '#CFF0FF');
+  ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+
+  // sun
+  ctx.save();
+  const sunG = ctx.createRadialGradient(W * 0.85, H * 0.13, 0, W * 0.85, H * 0.13, W * 0.16);
+  sunG.addColorStop(0, 'rgba(255,240,150,0.95)'); sunG.addColorStop(1, 'rgba(255,240,150,0)');
+  ctx.fillStyle = sunG; ctx.fillRect(W * 0.6, 0, W * 0.4, H * 0.35);
+  ctx.fillStyle = '#FFE65C';
+  ctx.beginPath(); ctx.arc(W * 0.85, H * 0.13, W * 0.06, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+
+  // clouds
+  clouds.forEach(c => drawCloud(ctx, c.x * W, c.y * H, c.scale, W));
+
+  // pitch
+  const groundY = GROUND_Y * H;
+  const gg = ctx.createLinearGradient(0, groundY, 0, H);
+  gg.addColorStop(0, '#7ED957'); gg.addColorStop(1, '#4E9A36');
+  ctx.fillStyle = gg; ctx.fillRect(0, groundY, W, H - groundY);
+  // mowing stripes
+  ctx.save(); ctx.globalAlpha = 0.10; ctx.fillStyle = '#000';
+  for (let i = 0; i < 8; i++) { if (i % 2) ctx.fillRect(i/8*W, groundY, W/8, H - groundY); }
+  ctx.restore();
+  // ground line
+  ctx.strokeStyle = 'rgba(255,255,255,0.7)'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(0, groundY); ctx.lineTo(W, groundY); ctx.stroke();
+
+  // goal (right side)
+  drawGoal(ctx, GOAL_X * W, groundY, W, H);
+
+  // ball
+  drawBall(ctx, ballX * W, groundY - W * 0.045, W * 0.045, rot, detected);
+
+  // "blow!" hint when the ball is resting
+  if (!detected && Math.abs(vel) < 0.0008 && ballX < GOAL_X - 0.02) {
+    ctx.save(); ctx.textAlign = 'center';
+    ctx.font = `bold ${Math.round(W*0.045)}px "Comic Sans MS", cursive`;
+    ctx.fillStyle = '#1577C7'; ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.lineWidth = 5;
+    const bx = ballX * W, hy = groundY - W * 0.16;
+    ctx.strokeText('Дуй: шшш!', bx, hy); ctx.fillText('Дуй: шшш!', bx, hy);
+    // little arrow toward the goal
+    ctx.strokeStyle = '#1577C7'; ctx.lineWidth = 5; ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(bx + W*0.06, groundY - W*0.05); ctx.lineTo(bx + W*0.12, groundY - W*0.05);
+    ctx.moveTo(bx + W*0.10, groundY - W*0.07); ctx.lineTo(bx + W*0.12, groundY - W*0.05);
+    ctx.lineTo(bx + W*0.10, groundY - W*0.03); ctx.stroke();
+    ctx.restore();
+  }
+  // puff of wind while blowing
+  if (detected) {
+    ctx.save(); ctx.strokeStyle = 'rgba(255,255,255,0.7)'; ctx.lineWidth = W*0.006; ctx.lineCap='round';
+    const bx = ballX * W, by = groundY - W*0.045, t = Date.now();
+    for (let i=0;i<3;i++){
+      const off = (t/200 + i) % 1;
+      ctx.globalAlpha = 0.6 * (1-off);
+      const x0 = bx - W*0.10 - off*W*0.03, y = by - W*0.02 + i*W*0.02;
+      ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x0 + W*0.05, y); ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // goal counter (top center)
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.font = `bold ${Math.round(W * 0.05)}px "Comic Sans MS", cursive`;
+  ctx.fillStyle = '#fff'; ctx.strokeStyle = 'rgba(30,90,40,0.7)'; ctx.lineWidth = 5;
+  const txt = `⚽ ${goals} / ${GOALS_TO_WIN}`;
+  ctx.strokeText(txt, W * 0.5, H * 0.09); ctx.fillText(txt, W * 0.5, H * 0.09);
+  ctx.restore();
+
+  // sparks
+  sparks.forEach(p => {
+    ctx.save(); ctx.globalAlpha = p.alpha;
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  });
+
+  // praise
+  if (praise && praiseAlpha > 0) {
+    ctx.save(); ctx.globalAlpha = praiseAlpha; ctx.textAlign = 'center';
+    ctx.font = `bold ${Math.round(W * 0.08)}px "Comic Sans MS", cursive`;
+    ctx.fillStyle = '#FF8A3D'; ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.lineWidth = 6;
+    ctx.strokeText(praise, W * 0.5, H * 0.34); ctx.fillText(praise, W * 0.5, H * 0.34);
+    ctx.restore();
+  }
+
+  // mic level (bottom-left)
+  const mbW = W * 0.32, mbH = 18, mbX = 16, mbY = H * 0.06;
+  ctx.fillStyle = 'rgba(0,0,0,0.2)'; roundRect(ctx, mbX, mbY, mbW, mbH, 9); ctx.fill();
+  ctx.fillStyle = detected ? '#27C2A0' : '#4D96FF';
+  roundRect(ctx, mbX, mbY, mbW * clamp(rms / 0.25, 0, 1), mbH, 9); ctx.fill();
+  ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.font = `${Math.round(mbH * 0.85)}px sans-serif`;
+  ctx.textAlign = 'left'; ctx.fillText('🎤', mbX + mbW + 6, mbY + mbH - 1);
+
+  // therapist overlay
+  if (showTherapist) {
+    ctx.save(); ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    roundRect(ctx, 10, H*0.06 + 28, 230, 82, 12); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.font = '13px monospace'; ctx.textAlign = 'left';
+    const y0 = H*0.06 + 48;
+    ctx.fillText(`RMS:   ${rms.toFixed(4)}`, 20, y0);
+    ctx.fillText(`ВЧ-частка: ${highRatio.toFixed(2)} (>${HIGH_RATIO_MIN})`, 20, y0 + 20);
+    ctx.fillText(`Звук Ш: ${detected ? '✓ ТАК' : '✗ ні'}`, 20, y0 + 40);
+    ctx.restore();
+  }
+}
+
+function drawCloud(ctx, cx, cy, scale, W) {
+  const r = W * 0.05 * scale;
+  ctx.save(); ctx.fillStyle = 'rgba(255,255,255,0.92)';
+  [[0,0,r],[-r*0.8,r*0.2,r*0.7],[r*0.8,r*0.2,r*0.7],[-r*0.35,-r*0.45,r*0.6],[r*0.4,-r*0.4,r*0.55]]
+    .forEach(([dx,dy,rad])=>{ ctx.beginPath(); ctx.arc(cx+dx,cy+dy,rad,0,Math.PI*2); ctx.fill(); });
+  ctx.restore();
+}
+
+function drawGoal(ctx, gx, groundY, W, H) {
+  const gw = W * 0.17, gh = W * 0.15, post = W * 0.013;
+  const topY = groundY - gh, leftX = gx - gw * 0.2, rightX = gx + gw * 0.8;
+  // net
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255,255,255,0.55)'; ctx.lineWidth = 1.5;
+  const cols = 7, rows = 6;
+  for (let i = 0; i <= cols; i++) { const x = leftX + (rightX-leftX)*i/cols; ctx.beginPath(); ctx.moveTo(x, topY); ctx.lineTo(x, groundY); ctx.stroke(); }
+  for (let j = 0; j <= rows; j++) { const y = topY + (groundY-topY)*j/rows; ctx.beginPath(); ctx.moveTo(leftX, y); ctx.lineTo(rightX, y); ctx.stroke(); }
+  ctx.restore();
+  // posts + crossbar
+  ctx.save();
+  ctx.fillStyle = '#fff'; ctx.strokeStyle = 'rgba(0,0,0,0.12)'; ctx.lineWidth = 1;
+  ctx.fillRect(leftX - post/2, topY, post, groundY - topY);
+  ctx.fillRect(rightX - post/2, topY, post, groundY - topY);
+  ctx.fillRect(leftX - post/2, topY - post/2, (rightX-leftX) + post, post);
+  ctx.restore();
+}
+
+function drawBall(ctx, cx, cy, r, rot, active) {
+  const t = Date.now();
+  ctx.save();
+  // shadow
+  ctx.save(); ctx.globalAlpha = 0.18; ctx.fillStyle = '#000';
+  ctx.beginPath(); ctx.ellipse(cx, cy + r*0.95, r*0.95, r*0.22, 0, 0, Math.PI*2); ctx.fill(); ctx.restore();
+
+  ctx.translate(cx, cy);
+  ctx.rotate(rot);
+  // white ball
+  const g = ctx.createRadialGradient(-r*0.3, -r*0.3, r*0.1, 0, 0, r);
+  g.addColorStop(0, '#ffffff'); g.addColorStop(1, '#d7dde3');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI*2); ctx.fill();
+  // pentagons (classic football look)
+  ctx.fillStyle = '#2b2b2b';
+  ctx.beginPath(); ctx.arc(0, 0, r*0.32, 0, Math.PI*2); ctx.fill();
+  for (let i = 0; i < 5; i++) {
+    const a = (Math.PI*2/5)*i - Math.PI/2;
+    const px = Math.cos(a)*r*0.62, py = Math.sin(a)*r*0.62;
+    ctx.save(); ctx.translate(px, py); ctx.rotate(a + Math.PI/2);
+    ctx.beginPath(); ctx.ellipse(0, 0, r*0.16, r*0.13, 0, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+  ctx.strokeStyle = 'rgba(0,0,0,0.25)'; ctx.lineWidth = r*0.05;
+  ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI*2); ctx.stroke();
+  ctx.restore();
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+}
+
+// ─── App ─────────────────────────────────────────────────────────────────────
+function App() {
+  const canvasRef = useRef(null);
+  const audioRef = useRef(null);
+  const rafRef = useRef(null);
+  const timerRef = useRef(null);
+
+  const stateRef = useRef({
+    ballX: START_X, vel: 0, rot: 0,
+    detected: false, rms: 0, highRatio: 0, voicing: 0,
+    goals: 0, wonSignaled: false,
+    sparks: [], praise: null, praiseAlpha: 0,
+    clouds: CLOUDS.map(c => ({ ...c })),
+    lastTime: 0, showTherapist: false,
+  });
+
+  const [phase, setPhase] = useState('start');
+  const [showTherapist, setShowTherapist] = useState(false);
+  useEffect(() => { stateRef.current.showTherapist = showTherapist; }, [showTherapist]);
+
+  const startAudio = useCallback((analyser) => {
+    const freq = new Float32Array(analyser.frequencyBinCount);
+    const time = new Float32Array(analyser.fftSize);
+    const detect = makeShDetector(analyser.context.sampleRate, analyser.fftSize);
+    let confirm = 0;
+    const actx = analyser.context;
+    timerRef.current = setInterval(() => {
+      // iOS Safari parks the context ('suspended'/'interrupted') after a system
+      // sound or a screen dim, which freezes the analyser. Nudge it back.
+      if (actx.state !== 'running' && actx.resume) actx.resume();
+      analyser.getFloatFrequencyData(freq);
+      analyser.getFloatTimeDomainData(time);
+      let sum = 0; for (let i = 0; i < time.length; i++) sum += time[i]*time[i];
+      const rms = Math.sqrt(sum / time.length);
+      const r = detect(freq, rms);
+      if (r.detected) confirm = Math.min(confirm + 1, CONFIRM_FRAMES); else confirm = 0;
+      const s = stateRef.current;
+      s.detected = confirm >= CONFIRM_FRAMES;
+      s.rms = r.rms; s.highRatio = r.highRatio; s.voicing = r.voicing;
+    }, 20);
+  }, []);
+
+  const animate = useCallback((now) => {
+    const canvas = canvasRef.current; if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    const s = stateRef.current;
+    const dt = s.lastTime ? Math.min(now - s.lastTime, 50) : 16;
+    s.lastTime = now;
+    const f = dt / 16;   // frames elapsed (for frame-rate-independent physics)
+
+    s.clouds.forEach(c => { c.x = (c.x + c.speed*dt) % 1.15; if (c.x > 1.1) c.x = -0.15; });
+
+    // Blow "Ш" → push the ball right; friction always bleeds speed so it coasts
+    // to a stop. It takes a few blows to roll all the way into the goal.
+    if (s.detected) s.vel = Math.min(MAX_VEL, s.vel + ACCEL * f);
+    s.vel *= Math.pow(FRICTION, f);
+    if (s.vel < 0.00005) s.vel = 0;
+    s.ballX += s.vel * f;
+    s.rot += s.vel * f * ROT_K;
+
+    // Goal!
+    if (s.ballX >= GOAL_X) {
+      s.ballX = GOAL_X; s.vel = 0;
+      s.goals += 1;
+      s.praise = PRAISE[(s.goals-1) % PRAISE.length]; s.praiseAlpha = 1;
+      const gx = GOAL_X*W, gy = GROUND_Y*H - W*0.045;
+      for (let i=0;i<26;i++) s.sparks.push({
+        x: gx, y: gy, r: 4+Math.random()*8, alpha:1,
+        color: ['#FFC93C','#27C2A0','#FF6B9D','#fff'][i%4],
+        vx:(Math.random()-0.5)*7, vy:(Math.random()-0.7)*7, decay:0.02 });
+      if (s.goals >= GOALS_TO_WIN && !s.wonSignaled) { s.wonSignaled = true; setPhase('won'); }
+      else { s.ballX = START_X; s.rot = 0; }
+    }
+
+    // particles
+    s.sparks = s.sparks.map(p => ({ ...p, x:p.x+p.vx, y:p.y+p.vy, vy:p.vy+0.15, alpha:p.alpha-p.decay }))
+      .filter(p => p.alpha > 0);
+    if (s.praiseAlpha > 0) s.praiseAlpha = Math.max(0, s.praiseAlpha - 0.01);
+
+    drawScene(ctx, W, H, s);
+
+    window.__telemetry = {
+      game: '⚽ Футбол',
+      primaryLabel: 'Голи ⚽',
+      primary: s.goals + ' / ' + GOALS_TO_WIN,
+      detect: s.detected,
+      level: s.rms,
+      extra: s.detected ? 'звук Ш' : '',
+    };
+
+    rafRef.current = requestAnimationFrame(animate);
+  }, []);
+
+  const startGame = useCallback(async () => {
+    try {
+      // All browser voice-DSP OFF: noiseSuppression strips the "Ш" hiss outright,
+      // and autoGainControl rides a steady blow down until detection dies. We
+      // boost the (now faint) phone mic ourselves with a fixed GainNode — a
+      // steady gain that never adapts. It scales rms over RMS_FLOOR but leaves
+      // highRatio untouched, since that is an energy *ratio*.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { noiseSuppression: false, autoGainControl: false, echoCancellation: false },
+        video: false,
+      });
+      const actx = new (window.AudioContext || window.webkitAudioContext)();
+      if (actx.state === 'suspended') await actx.resume();
+      const src = actx.createMediaStreamSource(stream);
+      const gain = actx.createGain();
+      gain.gain.value = 4;            // recover the level AGC used to provide
+      const analyser = actx.createAnalyser();
+      analyser.fftSize = 2048;
+      analyser.smoothingTimeConstant = 0.3;
+      src.connect(gain);
+      gain.connect(analyser);
+      audioRef.current = { actx, stream };
+      startAudio(analyser);
+      setPhase('playing');
+      rafRef.current = requestAnimationFrame(animate);
+    } catch (e) { console.error(e); setPhase('denied'); }
+  }, [animate, startAudio]);
+
+  const restartGame = useCallback(() => {
+    const s = stateRef.current;
+    s.ballX = START_X; s.vel = 0; s.rot = 0; s.goals = 0; s.wonSignaled = false;
+    s.sparks = []; s.praise = null; s.praiseAlpha = 0;
+    setPhase('playing');
+  }, []);
+
+  useEffect(() => {
+    const canvas = canvasRef.current; if (!canvas) return;
+    const resize = () => { canvas.width = window.innerWidth; canvas.height = window.innerHeight; };
+    resize(); window.addEventListener('resize', resize);
+    return () => window.removeEventListener('resize', resize);
+  }, []);
+
+  useEffect(() => () => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    if (timerRef.current) clearInterval(timerRef.current);
+    if (audioRef.current) { audioRef.current.stream.getTracks().forEach(t=>t.stop()); audioRef.current.actx.close(); }
+  }, []);
+
+  return (
+    <div style={{ width:'100%', height:'100%', position:'relative' }}>
+      <canvas ref={canvasRef} style={{ position:'absolute', inset:0 }} />
+      {phase === 'start' && <StartScreen onStart={startGame} />}
+      {phase === 'denied' && <PermissionDenied onRetry={startGame} />}
+      {phase === 'playing' && <TherapistToggle active={showTherapist} onToggle={()=>setShowTherapist(v=>!v)} />}
+      {phase === 'won' && <WinScreen onRestart={restartGame} />}
+    </div>
+  );
+}
+
+// ─── Screens ─────────────────────────────────────────────────────────────────
+function StartScreen({ onStart }) {
+  return (
+    <div style={screenBg('linear-gradient(160deg, #7EC8FF 0%, #9BE38C 100%)')}>
+      <div style={{ fontSize:'clamp(26px,7vw,58px)', fontWeight:'bold', color:'#1a6e3a',
+        textShadow:'2px 3px 0 rgba(255,255,255,0.7)', textAlign:'center', padding:'0 20px' }}>
+        ⚽ Футбол
+      </div>
+      <div style={{ fontSize:'clamp(14px,3.6vw,26px)', color:'#236a2a', textAlign:'center',
+        padding:'0 30px', marginTop:'6px', marginBottom:'18px', lineHeight:1.4 }}>
+        Дуй «шшш» — і м'ячик покотиться<br />у ворота! 🥅
+      </div>
+      <div style={{ fontSize:'clamp(70px,20vw,150px)', marginBottom:'18px',
+        filter:'drop-shadow(0 8px 12px rgba(0,0,0,0.15))' }}>⚽</div>
+      <div style={{ background:'rgba(255,255,255,0.85)', borderRadius:'20px',
+        padding:'clamp(12px,3vw,22px) clamp(16px,5vw,40px)', maxWidth:'520px', width:'90%',
+        marginBottom:'26px', textAlign:'center' }}>
+        <div style={{ fontSize:'clamp(13px,3vw,20px)', color:'#2a6a3a', lineHeight:1.6 }}>
+          🎤 Дозволь доступ до мікрофона<br />
+          💨 Дуй довге <strong>«ш-ш-ш»</strong> (3 рази)<br />
+          🥅 Закоти м'яч у ворота!
+        </div>
+      </div>
+      <button onClick={onStart} style={btn('#27A05A','#4FD17F')}>⚽ Почати!</button>
+    </div>
+  );
+}
+function PermissionDenied({ onRetry }) {
+  return (
+    <div style={screenBg('linear-gradient(160deg, #ffecd2 0%, #fcb69f 100%)')}>
+      <div style={{ fontSize:'clamp(50px,15vw,120px)', marginBottom:'16px' }}>🎤</div>
+      <div style={{ fontSize:'clamp(20px,5vw,38px)', fontWeight:'bold', color:'#c0392b',
+        marginBottom:'12px', textAlign:'center' }}>Мікрофон недоступний</div>
+      <div style={{ background:'rgba(255,255,255,0.7)', borderRadius:'16px', padding:'16px 24px',
+        maxWidth:'460px', width:'90%', marginBottom:'26px', fontSize:'clamp(13px,3vw,20px)',
+        color:'#555', lineHeight:1.6, textAlign:'center' }}>
+        Дозволь доступ до мікрофона у браузері<br />🔒 (іконка замка в адресному рядку) і спробуй ще.
+      </div>
+      <button onClick={onRetry} style={btn('#2980b9','#3498db')}>🔄 Спробувати знову</button>
+    </div>
+  );
+}
+function WinScreen({ onRestart }) {
+  return (
+    <div style={screenBg('radial-gradient(circle at 50% 35%, rgba(255,255,255,0.85), rgba(120,210,140,0.92))')}>
+      <div style={{ fontSize:'clamp(48px,13vw,120px)', marginBottom:'6px' }}>🎉⚽🥅</div>
+      <div style={{ fontSize:'clamp(26px,7vw,60px)' }}>⚽⚽⚽</div>
+      <div style={{ fontSize:'clamp(26px,7vw,60px)', fontWeight:'bold', color:'#1a6e3a',
+        textShadow:'2px 3px 0 rgba(255,255,255,0.8)', textAlign:'center', margin:'8px 0' }}>Молодець! 🌟</div>
+      <div style={{ fontSize:'clamp(16px,4vw,30px)', color:'#236a2a', textAlign:'center',
+        marginBottom:'30px' }}>Усі м'ячі — у воротах!</div>
+      <button onClick={onRestart} style={btn('#27A05A','#4FD17F')}>🔄 Ще раз!</button>
+    </div>
+  );
+}
+function TherapistToggle({ active, onToggle }) {
+  return (
+    <button onClick={onToggle} title="Режим логопеда" style={{
+      position:'absolute', bottom:'16px', right:'16px',
+      background: active ? 'rgba(30,110,58,0.9)' : 'rgba(0,0,0,0.3)', color:'#fff', border:'none',
+      borderRadius:'50px', padding:'8px 16px', fontSize:'14px', fontFamily:'inherit',
+      cursor:'pointer', touchAction:'manipulation', zIndex:10 }}>
+      {active ? '🩺 Режим логопеда: ВКЛ' : '🩺'}
+    </button>
+  );
+}
+function screenBg(bg) {
+  return { position:'absolute', inset:0, display:'flex', flexDirection:'column',
+    alignItems:'center', justifyContent:'center', background:bg, padding:'20px' };
+}
+function btn(c1, c2) {
+  return { background:`linear-gradient(145deg, ${c1}, ${c2})`, color:'#fff', border:'none',
+    borderRadius:'50px', padding:'clamp(16px,4vw,24px) clamp(40px,10vw,80px)',
+    fontSize:'clamp(20px,5vw,40px)', fontFamily:'inherit', fontWeight:'bold',
+    cursor:'pointer', boxShadow:`0 6px 20px ${c1}88`, touchAction:'manipulation' };
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+<!-- Live monitoring for the therapist (active only when ?code= is present) -->
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="../lib/ice-config.js"></script>
+<script src="../lib/monitor.js"></script>
+</body>
+</html>
