@@ -25,8 +25,9 @@ const { useState, useEffect, useRef, useCallback } = React;
 
 // ─── Detection tuning for the "Ж" buzz ───────────────────────────────────────
 const RMS_FLOOR       = 0.02;   // ignore quiet background
-const HIGH_RATIO_MIN  = 0.12;   // fraction of (linear) energy in the fricative band
-const VOICING_MIN     = 0.06;   // some low-freq voicing → ж (voiced), not ш
+const HIGH_RATIO_MIN  = 0.45;   // fraction of (linear) energy that is fricative (vs vowels)
+const SH_SHARE_MIN    = 0.42;   // of the frication, how much sits in the ж/ш band (vs higher з/с)
+const VOICING_MIN     = 0.05;   // some low-freq voicing → ж (voiced), not ш
 const CONFIRM_FRAMES  = 3;      // consecutive positives before lift
 
 // Movement
@@ -49,9 +50,12 @@ function lerp(a, b, t) { return a + (b - a) * t; }
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
 // ─── "Ж" detector (frequency-domain) ─────────────────────────────────────────
-// "Ж" is a sustained VOICED FRICATIVE: lots of high-frequency noise (frication)
-// plus low-frequency voicing. We require both, which separates it from vowels
-// (energy mostly low → small high-ratio) and from the unvoiced "Ш" (no voicing).
+// "Ж" is a sustained VOICED FRICATIVE. Three things must hold together, which is
+// what tells it apart from its neighbours:
+//   • enough frication           → not a vowel (energy mostly low)
+//   • voicing in the low band     → "Ж", not the unvoiced "Ш"
+//   • frication sits in the ж/ш band (1.8–4.5 kHz), not the higher з/с band
+//     (4.5–9.5 kHz) → "Ж", not the (also voiced) "З"
 //
 // IMPORTANT: we work in LINEAR POWER (10^(dB/10)). Using the raw dB / byte
 // spectrum makes quiet high-frequency bins look loud, so almost any sound would
@@ -67,15 +71,18 @@ function makeZhDetector(sampleRate, fftSize) {
   }
   return function detect(freqDb, rms) {
     if (rms < RMS_FLOOR) return { detected: false, rms, highRatio: 0, voicing: 0 };
-    const lowP  = bandPower(freqDb, 120, 1200);
-    const midP  = bandPower(freqDb, 1200, 2600);
-    const fric  = bandPower(freqDb, 2600, 7800);   // frication energy (ж/ш)
+    const lowP  = bandPower(freqDb, 120, 900);     // voice / vowels
     const voic  = bandPower(freqDb, 85, 450);      // voicing energy (ж, not ш) — low pitches too
-    const total = lowP + midP + fric + 1e-12;
-    const highRatio = fric / total;
-    const voicing   = voic / total;
-    const detected = highRatio > HIGH_RATIO_MIN && voicing > VOICING_MIN;
-    return { detected, rms, highRatio, voicing };
+    const xLo   = bandPower(freqDb, 900, 1800);    // low frication (х)
+    const sh    = bandPower(freqDb, 1800, 4500);   // ж/ш frication core
+    const sHi   = bandPower(freqDb, 4500, 9500);   // з/с frication core (higher)
+    const fric  = xLo + sh + sHi;
+    const total = lowP + fric + 1e-12;
+    const highRatio = fric / total;                // fricative vs vowels
+    const shShare   = sh / (fric + 1e-12);          // where the frication sits (ж vs з)
+    const voicing   = voic / total;                 // voiced (ж) vs unvoiced (ш)
+    const detected = highRatio > HIGH_RATIO_MIN && shShare > SH_SHARE_MIN && voicing > VOICING_MIN;
+    return { detected, rms, highRatio, shShare, voicing };
   };
 }
 
@@ -92,7 +99,7 @@ const GROUND_FLOWERS = Array.from({ length: 9 }, (_, i) => ({
 
 // ─── Drawing ─────────────────────────────────────────────────────────────────
 function drawScene(ctx, W, H, s) {
-  const { beeY, detected, rms, highRatio, voicing, flower, fill, atFlower,
+  const { beeY, detected, rms, highRatio, shShare, voicing, flower, fill, atFlower,
           nectar, sparks, praise, praiseAlpha, clouds, showTherapist } = s;
 
   // sky
@@ -206,12 +213,13 @@ function drawScene(ctx, W, H, s) {
   // therapist overlay
   if (showTherapist) {
     ctx.save(); ctx.fillStyle = 'rgba(0,0,0,0.55)';
-    roundRect(ctx, 10, 10, 230, 100, 12); ctx.fill();
+    roundRect(ctx, 10, 10, 250, 122, 12); ctx.fill();
     ctx.fillStyle = '#fff'; ctx.font = '13px monospace'; ctx.textAlign = 'left';
     ctx.fillText(`RMS:   ${rms.toFixed(4)}`, 20, 32);
     ctx.fillText(`ВЧ-частка: ${highRatio.toFixed(2)} (>${HIGH_RATIO_MIN})`, 20, 52);
-    ctx.fillText(`Голос: ${voicing.toFixed(2)} (>${VOICING_MIN})`, 20, 72);
-    ctx.fillText(`Звук Ж: ${detected ? '✓ ТАК' : '✗ ні'}`, 20, 92);
+    ctx.fillText(`Ж-фокус: ${shShare.toFixed(2)} (>${SH_SHARE_MIN})`, 20, 72);
+    ctx.fillText(`Голос: ${voicing.toFixed(2)} (>${VOICING_MIN})`, 20, 92);
+    ctx.fillText(`Звук Ж: ${detected ? '✓ ТАК' : '✗ ні'}`, 20, 112);
     ctx.restore();
   }
 }
@@ -346,7 +354,7 @@ function App() {
 
   const stateRef = useRef({
     beeY: 0.8, targetBeeY: 0.8,
-    detected: false, rms: 0, highRatio: 0, voicing: 0,
+    detected: false, rms: 0, highRatio: 0, shShare: 0, voicing: 0,
     flower: firstFlower(),
     fill: 0, atFlower: false, grace: 0, nectar: 0, wonSignaled: false,
     sparks: [], praise: null, praiseAlpha: 0,
@@ -377,7 +385,7 @@ function App() {
       if (r.detected) confirm = Math.min(confirm + 1, CONFIRM_FRAMES); else confirm = 0;
       const s = stateRef.current;
       s.detected = confirm >= CONFIRM_FRAMES;
-      s.rms = r.rms; s.highRatio = r.highRatio; s.voicing = r.voicing;
+      s.rms = r.rms; s.highRatio = r.highRatio; s.shShare = r.shShare; s.voicing = r.voicing;
     }, 20);
   }, []);
 
