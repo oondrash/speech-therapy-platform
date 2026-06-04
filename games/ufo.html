@@ -32,8 +32,6 @@ const REARM_FRAC     = 0.70;   // re-arm once level dips to this fraction of its
 const RISE_FACTOR    = 1.05;   // only fire on a rising edge
 const PEAK_DECAY     = 0.985;  // recent-peak follower decay per ~20ms frame
 const REFRACTORY_MS  = 130;    // min gap between two counted syllables
-const SUSTAIN_FRAC   = 0.50;   // sound must stay above half its peak…
-const MIN_SUSTAIN    = 4;      // …for this many ~20ms frames → a held vowel, not a click/tap
 const FLOOR_MIN      = 0.003;
 const FLOOR_MAX      = 0.08;
 
@@ -57,33 +55,17 @@ const PRAISE = ['Клас! ⭐', 'Супер! 🌟', 'Зірочка! ✨', 'М�
 function lerp(a, b, t) { return a + (b - a) * t; }
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
-// ─── Onset detector (peak-relative, rising-edge, sustain-gated) ───────────────
-// A loud rising edge starts a CANDIDATE; it only counts as a syllable once the
-// loudness has held above half its peak for MIN_SUSTAIN frames. A held vowel
-// (ла/ро/…) easily lasts that long, but a clap, tap, knock or other short noise
-// collapses immediately and is discarded — so the saucer reacts to syllables,
-// not to every loud sound. Purely amplitude-based (no per-mic spectral tuning).
+// ─── Onset detector (peak-relative, rising-edge) — same as the dog game ────────
 function makeOnsetDetector() {
   let noiseFloor = 0.006, lastOnset = -9999, armed = true, peak = 0, prev = 0;
-  let cand = false, candFrames = 0, candPeak = 0;
   return function detect(rms, nowMs) {
     peak = Math.max(rms, peak * PEAK_DECAY);
     const high = Math.max(ONSET_MIN_RMS, noiseFloor * HIGH_FACTOR);
     const rising = rms > prev * RISE_FACTOR;
     let onset = false;
-
-    if (!cand && rms > high && rising && armed && (nowMs - lastOnset) > REFRACTORY_MS) {
-      cand = true; candFrames = 0; candPeak = rms; armed = false;
+    if (rms > high && rising && armed && (nowMs - lastOnset) > REFRACTORY_MS) {
+      onset = true; lastOnset = nowMs; armed = false; peak = rms;
     }
-    if (cand) {
-      candPeak = Math.max(candPeak, rms);
-      if (rms > candPeak * SUSTAIN_FRAC) {
-        if (++candFrames >= MIN_SUSTAIN) { onset = true; lastOnset = nowMs; cand = false; }
-      } else {
-        cand = false;            // collapsed too fast → a click/tap, not a syllable
-      }
-    }
-
     if (!armed && rms < peak * REARM_FRAC) armed = true;
     if (rms < Math.max(noiseFloor * 1.8, ONSET_MIN_RMS * 0.6)) {
       noiseFloor = clamp(lerp(noiseFloor, rms, 0.05), FLOOR_MIN, FLOOR_MAX);
