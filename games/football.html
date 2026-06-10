@@ -24,10 +24,10 @@
 const { useState, useEffect, useRef, useCallback } = React;
 
 // ─── Detection tuning for the "Ш" ─────────────────────────────────────────────
-const RMS_FLOOR      = 0.02;   // ignore quiet background
+const RMS_FLOOR      = 0.010;  // ignore quiet background (low, so a fading "шшш" still counts)
 const FRIC_MIN       = 0.45;   // share of energy that must be fricative (vs vowels)
 const SH_SHARE_MIN   = 0.45;   // of the fricative energy, how much sits in the "ш" band
-const CONFIRM_FRAMES = 2;      // consecutive positives before the ball rolls
+const CONFIRM_FRAMES = 1;      // consecutive positives before the ball rolls
 
 // Ball physics (horizontal)
 const START_X   = 0.13;        // ball starts near the left
@@ -376,7 +376,7 @@ function App() {
       if (actx.state === 'suspended') await actx.resume();
       const src = actx.createMediaStreamSource(stream);
       const gain = actx.createGain();
-      gain.gain.value = 4;            // recover the level AGC used to provide
+      gain.gain.value = 6;            // recover the level AGC used to provide (a faint "ш" needs headroom)
       const analyser = actx.createAnalyser();
       analyser.fftSize = 2048;
       analyser.smoothingTimeConstant = 0.3;
