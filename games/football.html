@@ -26,7 +26,7 @@ const { useState, useEffect, useRef, useCallback } = React;
 // ─── Detection tuning for the "Ш" ─────────────────────────────────────────────
 const RMS_FLOOR      = 0.010;  // ignore quiet background (low, so a fading "шшш" still counts)
 const FRIC_MIN       = 0.45;   // share of energy that must be fricative (vs vowels)
-const SH_SHARE_MIN   = 0.45;   // of the fricative energy, how much sits in the "ш" band
+const SH_SHARE_MIN   = 0.25;   // of the fricative energy, how much sits in the "ш" band
 const CONFIRM_FRAMES = 1;      // consecutive positives before the ball rolls
 
 // Ball physics (horizontal)
